@@ -7,6 +7,7 @@
 #include "SensirionI2CScd4x.h"
 #include "qrcode.h"
 #include "QRCodeGenerator.h"
+#include "mbedtls/aes.h"
 
 extern "C"
 {
@@ -32,12 +33,11 @@ constexpr int CURVE_SEC256R1_PKEY_HEX_DIGITS = 64;
 
 constexpr int EPD_WIDTH = 200;
 constexpr int EPD_HEIGHT = 200;
-constexpr unsigned long EPD_UPDATE_INTERVAL_MS = 180000; // 3 minutes
+// constexpr unsigned long EPD_UPDATE_INTERVAL_MS = 300000; // 5 minutes
 
 constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
 constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL; // Corrected to const char*
 constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
-
 static const char *TAG = "wifi dpp-enrollee";
 
 // Forward declarations (without static)
@@ -223,40 +223,138 @@ unsigned long lastUpdateTime = 0;
 bool isFirstUpdateDone = false;
 constexpr unsigned long SENSOR_READ_INTERVAL_MS = 5000; // 5 seconds
 
-void readAndDisplaySensorData()
-{
-  uint16_t co2;
-  float temperature, humidity;
+// void readAndDisplaySensorData()
+// {
+//   uint16_t co2;
+//   float temperature, humidity;
 
-  if (co2Sensor.readData(co2, temperature, humidity))
-  {
-    // Output sensor data to serial monitor
-    Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
+//   if (co2Sensor.readData(co2, temperature, humidity))
+//   {
+//     // Output sensor data to serial monitor
+//     Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
 
-    unsigned long currentTime = millis();
+//     unsigned long currentTime = millis();
 
-    // Display sensor data immediately on first update
-    if (!isFirstUpdateDone)
-    {
-      epaperDisplay.displaySensorData(co2, temperature, humidity);
-      lastUpdateTime = currentTime;
-      isFirstUpdateDone = true;
-    }
+//     // Display sensor data immediately on first update
+//     if (!isFirstUpdateDone)
+//     {
+//       epaperDisplay.displaySensorData(co2, temperature, humidity);
+//       lastUpdateTime = currentTime;
+//       isFirstUpdateDone = true;
+//     }
 
-    // Update e-paper display at intervals
-    if (currentTime - lastUpdateTime >= EPD_UPDATE_INTERVAL_MS)
-    {
-      epaperDisplay.displaySensorData(co2, temperature, humidity);
-      lastUpdateTime = currentTime;
-    }
-  }
-}
+//     // Update e-paper display at intervals
+//     if (currentTime - lastUpdateTime >= EPD_UPDATE_INTERVAL_MS)
+//     {
+//       epaperDisplay.displaySensorData(co2, temperature, humidity);
+//       lastUpdateTime = currentTime;
+//     }
+//   }
+// }
 
 // Wi-Fi and DPP variables
 wifi_config_t s_dpp_wifi_config;
 static int s_retry_num = 0;
 static EventGroupHandle_t s_dpp_event_group;
 static SemaphoreHandle_t xQrSemaphore = NULL;
+
+#define WIFI_SSID_KEY "wifi_ssid"
+#define WIFI_PASS_KEY "wifi_pass"
+
+// RTCメモリに保存するWi-Fi情報
+RTC_DATA_ATTR char rtc_ssid[32] = {0};
+RTC_DATA_ATTR char rtc_password[64] = {0};
+RTC_DATA_ATTR bool rtc_credentials_saved = false;
+
+bool read_wifi_credentials_from_nvs(char *ssid, size_t ssid_len, char *password, size_t pass_len)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to open NVS handle");
+    return false;
+  }
+
+  // SSIDを読み込み
+  err = nvs_get_str(nvs_handle, WIFI_SSID_KEY, ssid, &ssid_len);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to read SSID");
+    nvs_close(nvs_handle);
+    return false;
+  }
+
+  // パスワードを読み込み
+  err = nvs_get_str(nvs_handle, WIFI_PASS_KEY, password, &pass_len);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to read password");
+    nvs_close(nvs_handle);
+    return false;
+  }
+
+  nvs_close(nvs_handle);
+  return true;
+}
+
+// DPP認証情報を保存
+void save_wifi_credentials_to_nvs(const char *ssid, const char *password)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to open NVS handle");
+    return;
+  }
+
+  // SSIDとパスワードを保存
+  nvs_set_str(nvs_handle, WIFI_SSID_KEY, ssid);
+  nvs_set_str(nvs_handle, WIFI_PASS_KEY, password);
+  nvs_commit(nvs_handle);
+  nvs_close(nvs_handle);
+  Serial.printf("Wi-Fi credentials saved: SSID=%s\n", ssid);
+}
+
+// Wi-Fi接続を試行
+bool connect_to_wifi()
+{
+  char ssid[32] = {0};
+  char password[64] = {0};
+
+  // NVSからWi-Fi認証情報を読み取る
+  if (!read_wifi_credentials_from_nvs(ssid, sizeof(ssid), password, sizeof(password)))
+  {
+    return false; // 認証情報がない場合は接続せず終了
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  // 接続を試行
+  Serial.println("Connecting to Wi-Fi...");
+  int retry_count = 0;
+  while (WiFi.status() != WL_CONNECTED && retry_count < 10)
+  {
+    delay(500);
+    Serial.print(".");
+    retry_count++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.printf("\nConnected to Wi-Fi! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true; // 接続成功
+  }
+  else
+  {
+    Serial.println("\nFailed to connect to Wi-Fi.");
+    return false; // 接続失敗
+  }
+}
 
 void generateQRCode(const char *data)
 {
@@ -318,6 +416,8 @@ void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, voi
 
 void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
 {
+  wifi_config_t *config = NULL; // switch文の外で変数を宣言
+
   switch (event)
   {
   case ESP_SUPP_DPP_URI_READY:
@@ -333,6 +433,10 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     break;
   case ESP_SUPP_DPP_CFG_RECVD:
     memcpy(&s_dpp_wifi_config, data, sizeof(s_dpp_wifi_config));
+    // Wi-Fi設定をNVSに保存
+    config = (wifi_config_t *)data;
+    save_wifi_credentials_to_nvs((const char *)config->sta.ssid, (const char *)config->sta.password);
+
     esp_wifi_set_config(WIFI_IF_STA, &s_dpp_wifi_config);
     ESP_LOGI(TAG, "DPP Authentication successful, connecting to AP: %s", s_dpp_wifi_config.sta.ssid);
     s_retry_num = 0;
@@ -414,19 +518,39 @@ void dpp_enrollee_init()
   vEventGroupDelete(s_dpp_event_group);
 }
 
+// タスクハンドラ
+TaskHandle_t sensorTaskHandle = NULL;
+
+// センサーとe-paper更新用のタスク
+void sensorTask(void *pvParameters)
+{
+  // センサーからデータを取得
+  uint16_t co2;
+  float temperature, humidity;
+
+  if (co2Sensor.readData(co2, temperature, humidity))
+  {
+    // センサーのデータを表示
+    Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
+    epaperDisplay.displaySensorData(co2, temperature, humidity);
+  }
+  else
+  {
+    Serial.println("Failed to read sensor data.");
+  }
+
+  // Deep Sleepに移行（5分後に復帰）
+  esp_sleep_enable_timer_wakeup(5 * 60 * 1000000); // 5分
+  Serial.println("Entering Deep Sleep...");
+  esp_deep_sleep_start();
+}
+
 // Arduino setup function
 void setup()
 {
   Serial.begin(115200);
 
-  // Initialize e-paper display
-  hspi.begin(13, 12, 14, 15);
-  epaperDisplay.init(hspi);
-
-  // Initialize CO₂ sensor
-  co2Sensor.init();
-
-  // Initialize NVS
+  // NVSの初期化
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
   {
@@ -435,15 +559,39 @@ void setup()
   }
   ESP_ERROR_CHECK(ret);
 
-  // Initialize DPP Enrollee
-  dpp_enrollee_init();
-}
+  // Deep Sleepからの復帰か確認
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
+  {
+    Serial.println("Woke up from Deep Sleep...");
+  }
+  else
+  {
+    Serial.println("Fresh start...");
+  }
 
-// Arduino loop function
-void loop()
-{
-  readAndDisplaySensorData();
-  delay(SENSOR_READ_INTERVAL_MS);
+  // Initialize e-paper display
+  hspi.begin(13, 12, 14, 15);
+  epaperDisplay.init(hspi);
+
+  // Initialize CO₂ sensor
+  co2Sensor.init();
+
+  // Wi-Fi接続試行
+  if (!connect_to_wifi())
+  {
+    Serial.println("Starting Wi-Fi DPP...");
+    dpp_enrollee_init(); // 接続できない場合DPPを開始
+  }
+
+  // センサータスクを作成
+  xTaskCreatePinnedToCore(
+      sensorTask,        // タスク関数
+      "SensorTask",      // タスク名
+      4096,              // スタックサイズ
+      NULL,              // 引数
+      1,                 // 優先度
+      &sensorTaskHandle, // タスクハンドラ
+      APP_CPU_NUM);      // タスクを動かすコア
 }
 
 // app_main function
@@ -451,9 +599,4 @@ extern "C" void app_main()
 {
   initArduino();
   setup();
-  while (true)
-  {
-    loop();
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
 }
