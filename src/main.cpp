@@ -8,6 +8,7 @@
 #include "qrcode.h"
 #include "QRCodeGenerator.h"
 #include "mbedtls/aes.h"
+#include <time.h>
 
 extern "C"
 {
@@ -23,7 +24,18 @@ extern "C"
 #include "nvs_flash.h"
 }
 
+// LEDインジケーター
 #define LED_PIN 2
+
+// 電子ペーパー
+constexpr int EPD_WIDTH = 200;
+constexpr int EPD_HEIGHT = 200;
+
+// Wi-Fi and DPP
+constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
+constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL;
+constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
+static const char *TAG = "wifi dpp-enrollee";
 
 constexpr EventBits_t DPP_CONNECTED_BIT = BIT0;
 constexpr EventBits_t DPP_CONNECT_FAIL_BIT = BIT1;
@@ -32,13 +44,22 @@ constexpr int WIFI_MAX_RETRY_NUM = 3;
 constexpr int QR_VERSION = 7;
 constexpr int CURVE_SEC256R1_PKEY_HEX_DIGITS = 64;
 
-constexpr int EPD_WIDTH = 200;
-constexpr int EPD_HEIGHT = 200;
+wifi_config_t s_dpp_wifi_config;
+static int s_retry_num = 0;
+static EventGroupHandle_t s_dpp_event_group;
+static SemaphoreHandle_t xQrSemaphore = NULL;
 
-constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
-constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL;
-constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
-static const char *TAG = "wifi dpp-enrollee";
+#define MAX_SSID_LEN 32
+#define MAX_PASSWORD_LEN 64
+RTC_DATA_ATTR char rtc_ssid[MAX_SSID_LEN] = {0};
+RTC_DATA_ATTR char rtc_password[MAX_PASSWORD_LEN] = {0};
+RTC_DATA_ATTR bool rtc_credentials_saved = false;
+RTC_DATA_ATTR bool rtc_enable_wifi_mode = true;
+
+// NTP
+const char *ntpServer = "ntp.nict.jp"; // NTPサーバー
+const long gmtOffset_sec = 3600 * 9;   // GMT+9
+const int daylightOffset_sec = 0;      // サマータイムオフセット
 
 // Forward declarations (without static)
 void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -122,35 +143,55 @@ public:
     display.setRotation(1);
   }
 
-  void displaySensorData(uint16_t co2, float temperature, float humidity)
+  void displayText(const char *text)
   {
-    char sensorData[100];
-    snprintf(sensorData, sizeof(sensorData), "CO2: %u\nTemp: %.1f C\nHumidity: %.1f %%", co2, temperature, humidity);
+    display.setFont(&FreeMonoBold9pt7b); // フォント設定
+    display.setTextColor(GxEPD_BLACK);   // テキストカラー設定
 
-    display.setFont(&FreeMonoBold9pt7b);
-    if (display.epd2.WIDTH < 104)
-      display.setFont(0);
-    display.setTextColor(GxEPD_BLACK);
-
+    // テキストのバウンドサイズを計算
     int16_t tbx, tby;
     uint16_t tbw, tbh;
-    display.getTextBounds(sensorData, 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.getTextBounds(text, 0, 0, &tbx, &tby, &tbw, &tbh);
 
-    // Center the text
-    uint16_t x = ((display.width() - tbw) / 2) - tbx;
-    uint16_t y = ((display.height() - tbh) / 2) - tby;
+    // テキストを中央に配置
+    uint16_t x = (display.width() - tbw) / 2;
+    uint16_t y = (display.height() - tbh) / 2;
 
-    display.setFullWindow();
+    display.setFullWindow(); // フルウィンドウ描画設定
     display.firstPage();
     do
     {
-      display.fillScreen(GxEPD_WHITE);
-      display.setCursor(x, y);
-      display.print(sensorData);
+      display.fillScreen(GxEPD_WHITE); // 画面を白でクリア
+      display.setCursor(x, y);         // テキスト描画位置を設定
+      display.print(text);             // テキストを描画
     } while (display.nextPage());
 
-    // Serial.println("Displayed sensor data on e-paper:");
-    // Serial.println(sensorData);
+    Serial.println("Displayed text on e-paper:");
+    Serial.println(text); // シリアルモニタへの出力
+  }
+
+  void displaySensorDataWithTimestamp(uint16_t co2, float temperature, float humidity)
+  {
+    char displayData[200]; // 表示内容のバッファ
+
+    struct tm timeinfo;
+    bool hasTimeInfo = rtc_enable_wifi_mode && getLocalTime(&timeinfo); // 時刻情報が利用可能か確認
+
+    if (hasTimeInfo)
+    {
+      char timeOnly[10];
+      strftime(timeOnly, sizeof(timeOnly), "%H:%M", &timeinfo); // 時間と分を取得
+      snprintf(displayData, sizeof(displayData), "Time: %s\nCO2: %u ppm\nTemp: %.1f C\nHumidity: %.1f %%",
+               timeOnly, co2, temperature, humidity);
+    }
+    else
+    {
+      snprintf(displayData, sizeof(displayData), "CO2: %u ppm\nTemp: %.1f C\nHumidity: %.1f %%",
+               co2, temperature, humidity);
+    }
+
+    displayText(displayData);    // 電子ペーパーに描画
+    Serial.println(displayData); // シリアルモニタにも出力
   }
 
   void displayQRCode(const char *data)
@@ -307,20 +348,6 @@ private:
 };
 
 CO2Sensor co2Sensor;
-
-// Wi-Fi and DPP variables
-wifi_config_t s_dpp_wifi_config;
-static int s_retry_num = 0;
-static EventGroupHandle_t s_dpp_event_group;
-static SemaphoreHandle_t xQrSemaphore = NULL;
-
-// RTCメモリに保存されるWi-Fi情報
-#define MAX_SSID_LEN 32
-#define MAX_PASSWORD_LEN 64
-RTC_DATA_ATTR char rtc_ssid[MAX_SSID_LEN] = {0};
-RTC_DATA_ATTR char rtc_password[MAX_PASSWORD_LEN] = {0};
-RTC_DATA_ATTR bool rtc_credentials_saved = false;
-RTC_DATA_ATTR bool rtc_disable_wifi_mode = false;
 
 // RTCメモリにWi-Fi情報を保存
 void save_wifi_credentials_to_rtc(const char *ssid, const char *password)
@@ -573,7 +600,7 @@ void dpp_enrollee_init()
     {
       ESP_LOGI(TAG, "DPP timeout. Switching to Wi-Fi disabled mode.");
     }
-    rtc_disable_wifi_mode = true;    // Wi-Fiなしモードを有効化
+    rtc_enable_wifi_mode = false;    // Wi-Fiなしモードを有効化
     currentLedStatus = LED_DPP_FAIL; // DPP失敗
     esp_supp_dpp_stop_listen();      // DPPリスニング停止
     esp_wifi_stop();                 // Wi-Fiモジュール停止
@@ -581,6 +608,28 @@ void dpp_enrollee_init()
 
   // リソース解放
   cleanup_dpp_resources();
+}
+
+// NTP
+void sync_ntp()
+{
+  if (!rtc_enable_wifi_mode)
+  {
+    Serial.println("Wi-Fi disabled mode: Skipping NTP synchronization.");
+    return;
+  }
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Time synchronization started.");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println("Time synchronized:");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
 }
 
 TaskHandle_t sensorTaskHandle = NULL;
@@ -598,7 +647,7 @@ void sensorTask(void *pvParameters)
   if (co2Sensor.readData(co2, temperature, humidity))
   {
     Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
-    epaperDisplay.displaySensorData(co2, temperature, humidity);
+    epaperDisplay.displaySensorDataWithTimestamp(co2, temperature, humidity);
   }
   else
   {
@@ -635,7 +684,6 @@ void setup()
   else
   {
     Serial.println("Fresh start...");
-    rtc_disable_wifi_mode = false; // 初期化
   }
 
   // Initialize e-paper display
@@ -643,10 +691,14 @@ void setup()
   epaperDisplay.init(hspi);
 
   // Wi-Fi接続試行
-  if (!rtc_disable_wifi_mode & !connect_to_wifi())
+  if (rtc_enable_wifi_mode)
   {
-    Serial.println("Starting Wi-Fi DPP...");
-    dpp_enrollee_init();
+    if (!connect_to_wifi())
+    {
+      Serial.println("Starting Wi-Fi DPP...");
+      dpp_enrollee_init();
+    }
+    sync_ntp(); // NTP同期
   }
 
   // センサータスクを作成
