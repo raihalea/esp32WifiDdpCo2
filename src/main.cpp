@@ -9,6 +9,10 @@
 #include "QRCodeGenerator.h"
 #include "mbedtls/aes.h"
 
+#define USE_BUNDLE_CERTS
+#include <WiFiClientSecure.h>
+#include <MQTTClient.h>
+
 extern "C"
 {
 #include "freertos/FreeRTOS.h"
@@ -21,15 +25,35 @@ extern "C"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
+#include "certs/aws_cert_ca.h"
+#include "certs/aws_cert_private.h"
+#include "certs/aws_cert_crt.h"
 }
 
 // LEDインジケーター
 #define LED_PIN 2
+#define PWM_CHANNEL 0       // PWMチャンネル（0～15）
+#define PWM_FREQUENCY 5000  // PWM周波数（5000Hz）
+#define PWM_RESOLUTION 8    // 分解能（8ビット: 0～255）
+#define LED_MODE_OFF 0      // LEDがオフ
+#define LED_MODE_NORMAL 24  // 標準的な明るさ
+#define LED_MODE_BRIGHT 128 // 明るいモード
+#define LED_MODE_MAX 255    // 最大明るさ
+enum LedStatus
+{
+  LED_OFF,
+  LED_BLINK_SLOW,  // デバイス起動中
+  LED_BLINK_FAST,  // Wi-Fi接続中
+  LED_ON,          // QRコード表示中
+  LED_DPP_SUCCESS, // DPP成功
+  LED_DPP_FAIL     // DPP失敗
+};
+
+volatile LedStatus currentLedStatus = LED_OFF;
 
 // 電子ペーパー
 constexpr int EPD_WIDTH = 200;
 constexpr int EPD_HEIGHT = 200;
-// constexpr unsigned long EPD_UPDATE_INTERVAL_MS = 300000; // 5 minutes
 
 // WiFi
 constexpr EventBits_t DPP_CONNECTED_BIT = BIT0;
@@ -66,69 +90,64 @@ const char *ntpServer = "ntp.nict.jp"; // NTPサーバー
 const long gmtOffset_sec = 3600 * 9;   // GMT+9
 const int daylightOffset_sec = 0;      // サマータイムオフセット
 
+// IoT
+const char *AWS_IOT_ENDPOINT = "a18z7ul529j3la-ats.iot.us-east-1.amazonaws.com";
+WiFiClientSecure net;
+MQTTClient client(256);
+
 // Forward declarations (without static)
 void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data);
-
-enum LedStatus
-{
-  LED_OFF,
-  LED_BLINK_SLOW,  // デバイス起動中
-  LED_BLINK_FAST,  // Wi-Fi接続中
-  LED_ON,          // QRコード表示中
-  LED_DPP_SUCCESS, // DPP成功
-  LED_DPP_FAIL     // DPP失敗
-};
-
-volatile LedStatus currentLedStatus = LED_OFF;
 
 // LED制御タスク
 void ledTask(void *pvParameters)
 {
   pinMode(LED_PIN, OUTPUT);
+  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(LED_PIN, PWM_CHANNEL);
   while (true)
   {
     switch (currentLedStatus)
     {
     case LED_OFF:
-      digitalWrite(LED_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
       vTaskDelay(100 / portTICK_PERIOD_MS);
       break;
 
     case LED_BLINK_SLOW:
-      digitalWrite(LED_PIN, HIGH);
-      vTaskDelay(500 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
-      vTaskDelay(500 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
       break;
 
     case LED_BLINK_FAST:
-      digitalWrite(LED_PIN, HIGH);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_BRIGHT);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
       break;
 
     case LED_ON:
-      digitalWrite(LED_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, LED_MODE_MAX);
       vTaskDelay(100 / portTICK_PERIOD_MS);
       break;
 
     case LED_DPP_SUCCESS:
       for (int i = 0; i < 5; i++) // 短い点滅を5回
       {
-        digitalWrite(LED_PIN, HIGH);
+        ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
         vTaskDelay(50 / portTICK_PERIOD_MS);
-        digitalWrite(LED_PIN, LOW);
+        ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
         vTaskDelay(50 / portTICK_PERIOD_MS);
       }
       currentLedStatus = LED_OFF;
       break;
 
     case LED_DPP_FAIL:
-      digitalWrite(LED_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
       vTaskDelay(1000 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
       vTaskDelay(1000 / portTICK_PERIOD_MS);
       break;
     }
@@ -147,64 +166,6 @@ public:
     display.init();
     display.setRotation(1);
   }
-
-  // void displaySensorData(uint16_t co2, float temperature, float humidity)
-  // {
-  //   char sensorData[100];
-  //   snprintf(sensorData, sizeof(sensorData), "CO2: %u\nTemp: %.1f C\nHumidity: %.1f %%", co2, temperature, humidity);
-
-  //   display.setFont(&FreeMonoBold9pt7b);
-  //   if (display.epd2.WIDTH < 104)
-  //     display.setFont(0);
-  //   display.setTextColor(GxEPD_BLACK);
-
-  //   int16_t tbx, tby;
-  //   uint16_t tbw, tbh;
-  //   display.getTextBounds(sensorData, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-  //   // Center the text
-  //   uint16_t x = ((display.width() - tbw) / 2) - tbx;
-  //   uint16_t y = ((display.height() - tbh) / 2) - tby;
-
-  //   display.setFullWindow();
-  //   display.firstPage();
-  //   do
-  //   {
-  //     display.fillScreen(GxEPD_WHITE);
-  //     display.setCursor(x, y);
-  //     display.print(sensorData);
-  //   } while (display.nextPage());
-
-  //   Serial.println("Displayed sensor data on e-paper:");
-  //   Serial.println(sensorData);
-  // }
-
-  // void displayText(const char *text)
-  // {
-  //   display.setFont(&FreeMonoBold9pt7b); // フォント設定
-  //   display.setTextColor(GxEPD_BLACK);   // テキストカラー設定
-
-  //   // テキストのバウンドサイズを計算
-  //   int16_t tbx, tby;
-  //   uint16_t tbw, tbh;
-  //   display.getTextBounds(text, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-  //   // テキストを中央に配置
-  //   uint16_t x = (display.width() - tbw) / 2;
-  //   uint16_t y = (display.height() - tbh) / 2;
-
-  //   display.setFullWindow(); // フルウィンドウ描画設定
-  //   display.firstPage();
-  //   do
-  //   {
-  //     display.fillScreen(GxEPD_WHITE); // 画面を白でクリア
-  //     display.setCursor(x, y);         // テキスト描画位置を設定
-  //     display.print(text);             // テキストを描画
-  //   } while (display.nextPage());
-
-  //   Serial.println("Displayed text on e-paper:");
-  //   Serial.println(text); // シリアルモニタへの出力
-  // }
 
   void displaySensorDataWithTimestamp(uint16_t co2, float temperature, float humidity)
   {
@@ -276,6 +237,12 @@ public:
       }
 
       // CO2表示（数値と単位を分けて描画）
+      // CO2値が1000ppm超えであれば赤に設定
+      // if (co2 > 1000)
+      // {
+      //   display.setTextColor(GxEPD_RED);
+      // }
+
       display.getTextBounds(co2Display, 0, 0, &tbx, &tby, &tbw, &tbh);
       int16_t valueX = (display.width() - tbw - 60) / 2; // 数値を中央に配置
       int16_t unitX = valueX + tbw + 10;                 // 単位を数値の右に配置
@@ -284,6 +251,9 @@ public:
       display.setCursor(unitX, yOffset + tbh);
       display.print(unitCO2);
       yOffset += tbh + spacing;
+
+      // CO2の表示が終わったので、再度黒文字に戻す（温度・湿度は黒で表示）
+      display.setTextColor(GxEPD_BLACK);
 
       // 温度表示（数値と単位を分けて描画）
       display.getTextBounds(tempDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
@@ -305,6 +275,11 @@ public:
       display.print(unitHumidity);
 
     } while (display.nextPage());
+
+    display.refresh();
+
+    // display.hibernate();
+    // delay(5000);
 
     // シリアルモニタ出力（デバッグ用）
     Serial.println("Displayed sensor data with timestamp:");
@@ -449,35 +424,6 @@ CO2Sensor co2Sensor;
 unsigned long lastUpdateTime = 0;
 bool isFirstUpdateDone = false;
 constexpr unsigned long SENSOR_READ_INTERVAL_MS = 5000; // 5 seconds
-
-// void readAndDisplaySensorData()
-// {
-//   uint16_t co2;
-//   float temperature, humidity;
-
-//   if (co2Sensor.readData(co2, temperature, humidity))
-//   {
-//     // Output sensor data to serial monitor
-//     Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
-
-//     unsigned long currentTime = millis();
-
-//     // Display sensor data immediately on first update
-//     if (!isFirstUpdateDone)
-//     {
-//       epaperDisplay.displaySensorData(co2, temperature, humidity);
-//       lastUpdateTime = currentTime;
-//       isFirstUpdateDone = true;
-//     }
-
-//     // Update e-paper display at intervals
-//     if (currentTime - lastUpdateTime >= EPD_UPDATE_INTERVAL_MS)
-//     {
-//       epaperDisplay.displaySensorData(co2, temperature, humidity);
-//       lastUpdateTime = currentTime;
-//     }
-//   }
-// }
 
 bool read_wifi_credentials_from_nvs(char *ssid, size_t ssid_len, char *password, size_t pass_len)
 {
@@ -758,6 +704,32 @@ void sync_ntp()
   Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
 }
 
+void connectAWSIoT()
+{
+  net.setCACert(AWS_CERT_CA1);
+  // net.setCACert(AWS_CERT_CA3);
+  net.setCertificate(AWS_CERT_CRT);
+  net.setPrivateKey(AWS_CERT_PRIVATE);
+
+  client.begin(AWS_IOT_ENDPOINT, 8883, net);
+
+  Serial.print("Connecting to AWS IoT Core...");
+  while (!client.connect("ESP32_Device"))
+  {
+    Serial.print(".");
+    delay(1000);
+  }
+
+  if (!client.connected())
+  {
+    Serial.println("AWS IoT Core connection failed!");
+  }
+  else
+  {
+    Serial.println("Connected to AWS IoT Core!");
+  }
+}
+
 // タスクハンドラ
 TaskHandle_t sensorTaskHandle = NULL;
 
@@ -775,6 +747,27 @@ void sensorTask(void *pvParameters)
     // センサーのデータを表示
     Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
     epaperDisplay.displaySensorDataWithTimestamp(co2, temperature, humidity);
+
+    if (rtc_enable_wifi_mode)
+    {
+      connectAWSIoT(); // AWS IoT Coreへの接続
+
+      if (client.connected())
+      {
+        String payload = "{\"co2\":" + String(co2) +
+                         ", \"temperature\":" + String(temperature, 1) +
+                         ", \"humidity\":" + String(humidity, 1) + "}";
+        client.publish("esp32/sensorData", payload);
+        Serial.println("Published sensor data to AWS IoT Core:");
+        Serial.println(payload);
+      }
+      else
+      {
+        Serial.print("Failed to connect, rc=");
+        Serial.println(" Trying again in 5 seconds...");
+        delay(5000);
+      }
+    }
   }
   else
   {
