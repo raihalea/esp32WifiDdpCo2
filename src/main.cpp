@@ -164,7 +164,7 @@ public:
   {
     display.epd2.selectSPI(spi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
     display.init();
-    display.setRotation(1);
+    display.setRotation(3);
   }
 
   void displaySensorDataWithTimestamp(uint16_t co2, float temperature, float humidity)
