@@ -255,8 +255,9 @@ public:
       display.print(unitHumidity);
 
     } while (display.nextPage());
-
-    display.refresh();
+    // nextPage() の最終ページで既にフル更新＋powerOffまで済んでいるので
+    // ここで display.refresh() を呼ぶと同じ内容をもう一度フル更新してしまう
+    // （3色パネルは1回に十数秒かかるため起床時間が倍になる）
 
     // シリアルモニタ出力（デバッグ用）
     Serial.println("Displayed sensor data with timestamp:");
@@ -459,31 +460,58 @@ bool read_wifi_credentials_from_nvs(char *ssid, size_t ssid_len, char *password,
   return true;
 }
 
-// DPP認証情報を保存
-void save_wifi_credentials_to_nvs(const char *ssid, const char *password)
+// DPP認証情報を保存。
+// wifi_config_t の ssid/password は uint8_t[32] / uint8_t[64] の固定長配列で、
+// 上限長ちょうどの値（生のWPA2 PSKは16進64文字）ではNUL終端されない。
+// そのまま nvs_set_str に渡すと strlen が隣の構造体メンバまで読み進めてしまうため、
+// 必ず終端付きのバッファへ写してから保存する。
+void save_wifi_credentials_to_nvs(const uint8_t *ssid, const uint8_t *password)
 {
+  char ssid_buf[MAX_SSID_LEN + 1];
+  char pass_buf[MAX_PASSWORD_LEN + 1];
+  memcpy(ssid_buf, ssid, MAX_SSID_LEN);
+  ssid_buf[MAX_SSID_LEN] = '\0';
+  memcpy(pass_buf, password, MAX_PASSWORD_LEN);
+  pass_buf[MAX_PASSWORD_LEN] = '\0';
+
   nvs_handle_t nvs_handle;
   esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
 
   if (err != ESP_OK)
   {
-    ESP_LOGE(TAG, "Failed to open NVS handle");
+    ESP_LOGE(TAG, "Failed to open NVS handle: %s", esp_err_to_name(err));
     return;
   }
 
-  // SSIDとパスワードを保存
-  nvs_set_str(nvs_handle, WIFI_SSID_KEY, ssid);
-  nvs_set_str(nvs_handle, WIFI_PASS_KEY, password);
-  nvs_commit(nvs_handle);
+  // SSIDとパスワードを保存。
+  // ここで失敗したまま先へ進むと、次回起動で認証情報が読めず
+  // 毎回DPPからやり直しになるため、必ず結果を確認する。
+  err = nvs_set_str(nvs_handle, WIFI_SSID_KEY, ssid_buf);
+  if (err == ESP_OK)
+  {
+    err = nvs_set_str(nvs_handle, WIFI_PASS_KEY, pass_buf);
+  }
+  if (err == ESP_OK)
+  {
+    err = nvs_commit(nvs_handle);
+  }
   nvs_close(nvs_handle);
-  Serial.printf("Wi-Fi credentials saved: SSID=%s\n", ssid);
+
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to save Wi-Fi credentials: %s", esp_err_to_name(err));
+    return;
+  }
+  Serial.printf("Wi-Fi credentials saved: SSID=%s\n", ssid_buf);
 }
 
 // Wi-Fi接続を試行
 bool connect_to_wifi()
 {
-  char ssid[MAX_SSID_LEN] = {0};
-  char password[MAX_PASSWORD_LEN] = {0};
+  // nvs_get_str はNUL終端分の領域も要求するので +1 しておく
+  // （SSID 32文字ちょうど / PSK 16進64文字ちょうどで INVALID_LENGTH になる）
+  char ssid[MAX_SSID_LEN + 1] = {0};
+  char password[MAX_PASSWORD_LEN + 1] = {0};
 
   // NVSからWi-Fi認証情報を読み取る
   if (!read_wifi_credentials_from_nvs(ssid, sizeof(ssid), password, sizeof(password)))
@@ -613,7 +641,7 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     memcpy(&s_dpp_wifi_config, data, sizeof(s_dpp_wifi_config));
     // Wi-Fi設定をNVSに保存
     config = (wifi_config_t *)data;
-    save_wifi_credentials_to_nvs((const char *)config->sta.ssid, (const char *)config->sta.password);
+    save_wifi_credentials_to_nvs(config->sta.ssid, config->sta.password);
 
     esp_wifi_set_config(WIFI_IF_STA, &s_dpp_wifi_config);
     ESP_LOGI(TAG, "DPP Authentication successful, connecting to AP: %s", s_dpp_wifi_config.sta.ssid);
