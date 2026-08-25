@@ -163,9 +163,13 @@ public:
     const char *unitTemp = "C";
     const char *unitHumidity = "%";
 
-    // 時刻を取得
+    // 時刻を取得。
+    // 既定のgetLocalTime()は時刻が未設定だと5秒ブロックするので、
+    // タイムアウト0を明示して即座に判定させる。
+    // ESP32のRTCはDeep Sleepをまたいで時刻を保持するため、
+    // Wi-Fiに繋がらなかった周回でも前回の同期結果を表示できる。
     struct tm timeinfo;
-    bool hasTimeInfo = rtc_enable_wifi_mode && getLocalTime(&timeinfo);
+    bool hasTimeInfo = getLocalTime(&timeinfo, 0);
     if (hasTimeInfo)
     {
       strftime(timestamp, sizeof(timestamp), "%H:%M", &timeinfo);
@@ -505,8 +509,17 @@ void save_wifi_credentials_to_nvs(const uint8_t *ssid, const uint8_t *password)
   Serial.printf("Wi-Fi credentials saved: SSID=%s\n", ssid_buf);
 }
 
+// Wi-Fi接続の結果。
+// 「認証情報が無い」と「認証情報はあるが繋がらない」は対処が違うので区別する。
+enum WifiConnectResult
+{
+  WIFI_RESULT_CONNECTED,
+  WIFI_RESULT_NO_CREDENTIALS,
+  WIFI_RESULT_FAILED,
+};
+
 // Wi-Fi接続を試行
-bool connect_to_wifi()
+WifiConnectResult connect_to_wifi()
 {
   // nvs_get_str はNUL終端分の領域も要求するので +1 しておく
   // （SSID 32文字ちょうど / PSK 16進64文字ちょうどで INVALID_LENGTH になる）
@@ -516,7 +529,7 @@ bool connect_to_wifi()
   // NVSからWi-Fi認証情報を読み取る
   if (!read_wifi_credentials_from_nvs(ssid, sizeof(ssid), password, sizeof(password)))
   {
-    return false; // 認証情報がない場合は接続せず終了
+    return WIFI_RESULT_NO_CREDENTIALS; // 認証情報がない場合は接続せず終了
   }
 
   WiFi.mode(WIFI_STA);
@@ -535,12 +548,12 @@ bool connect_to_wifi()
   if (WiFi.status() == WL_CONNECTED)
   {
     Serial.printf("\nConnected to Wi-Fi! IP: %s\n", WiFi.localIP().toString().c_str());
-    return true; // 接続成功
+    return WIFI_RESULT_CONNECTED;
   }
   else
   {
     Serial.println("\nFailed to connect to Wi-Fi.");
-    return false; // 接続失敗
+    return WIFI_RESULT_FAILED;
   }
 }
 
@@ -744,10 +757,11 @@ void cleanup_dpp_resources()
   }
 }
 
-// DPPでのプロビジョニングを試みる。
-// 失敗しても決してabortせず、Wi-Fiなしモードに落ちて呼び出し元に戻る
+// DPPでのプロビジョニングを試みる。接続できたかを返す。
+// 失敗しても決してabortせず呼び出し元に戻る
 // （センサー読み取りと電子ペーパー更新はWi-Fiに依存しないため）。
-void dpp_enrollee_init()
+// Wi-Fiなしモードへ落とすかどうかは呼び出し元が判断する。
+bool dpp_enrollee_init()
 {
   currentLedStatus = LED_BLINK_FAST; // Wi-Fi接続中
 
@@ -755,8 +769,7 @@ void dpp_enrollee_init()
   if (s_dpp_event_group == NULL)
   {
     Serial.println("DPP: failed to create event group.");
-    rtc_enable_wifi_mode = false;
-    return;
+    return false;
   }
 
   bool connectionEstablished = false;
@@ -800,8 +813,6 @@ void dpp_enrollee_init()
 
   if (!connectionEstablished)
   {
-    ESP_LOGI(TAG, "Switching to Wi-Fi disabled mode.");
-    rtc_enable_wifi_mode = false;    // Wi-Fiなしモードを有効化
     currentLedStatus = LED_DPP_FAIL; // DPP失敗
   }
 
@@ -812,6 +823,8 @@ void dpp_enrollee_init()
   {
     WiFi.mode(WIFI_OFF); // Wi-Fiモジュール停止
   }
+
+  return connectionEstablished;
 }
 
 // NTP
@@ -883,13 +896,14 @@ void setup()
   ESP_ERROR_CHECK(ret);
 
   // Deep Sleepからの復帰か確認
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
+  const bool isColdBoot = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER);
+  if (isColdBoot)
   {
-    Serial.println("Woke up from Deep Sleep...");
+    Serial.println("Fresh start...");
   }
   else
   {
-    Serial.println("Fresh start...");
+    Serial.println("Woke up from Deep Sleep...");
   }
 
   // Initialize e-paper display
@@ -902,12 +916,42 @@ void setup()
   // Wi-Fi接続試行。ここでの失敗はすべて許容し、必ずsensorTaskまで到達させる
   if (rtc_enable_wifi_mode)
   {
-    if (!connect_to_wifi())
+    WifiConnectResult result = connect_to_wifi();
+    bool connected = (result == WIFI_RESULT_CONNECTED);
+
+    if (!connected)
     {
-      Serial.println("Starting Wi-Fi DPP...");
-      dpp_enrollee_init();
+      // DPPプロビジョニング（2分のリッスン＋QRコード表示で画面を占有する）に
+      // 入るのは次の2つの場合だけに絞る:
+      //   (a) 認証情報がまだ無い
+      //   (b) 電源投入直後で、保存済みの認証情報では繋がらなかった
+      //       → ルーターのパスワード変更などを抜き差しでやり直せるようにする。
+      //         NVSは電源断でも消えないので、この経路が無いと二度と再設定できない
+      // タイマー起床では入らない。APの一時的な不調で5分周期を潰さないため。
+      if (result == WIFI_RESULT_NO_CREDENTIALS || isColdBoot)
+      {
+        Serial.println("Starting Wi-Fi DPP...");
+        connected = dpp_enrollee_init();
+
+        // 認証情報が無いまま失敗した ＝ そもそも未プロビジョニング。
+        // 起床のたびに2分待つのは無駄なので、電源を入れ直すまでWi-Fiなしで動く。
+        // 認証情報がある場合はラッチしない（次回起床でリトライする）
+        if (!connected && result == WIFI_RESULT_NO_CREDENTIALS)
+        {
+          ESP_LOGI(TAG, "Not provisioned. Switching to Wi-Fi disabled mode.");
+          rtc_enable_wifi_mode = false;
+        }
+      }
+      else
+      {
+        Serial.println("Wi-Fi unavailable: will retry on next wake-up.");
+      }
     }
-    sync_ntp(); // NTP同期
+
+    if (connected)
+    {
+      sync_ntp(); // NTP同期
+    }
   }
 
   // センサータスクを作成
