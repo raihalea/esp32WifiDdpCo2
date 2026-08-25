@@ -55,12 +55,18 @@ constexpr EventBits_t DPP_CONNECT_FAIL_BIT = BIT1;
 constexpr EventBits_t DPP_AUTH_FAIL_BIT = BIT2;
 constexpr int WIFI_MAX_RETRY_NUM = 3;
 constexpr int QR_VERSION = 7;
-constexpr int CURVE_SEC256R1_PKEY_HEX_DIGITS = 64;
 constexpr unsigned long DPP_TIMEOUT_MS = 2 * 60 * 1000; // DPPプロビジョニングの待ち時間
 
-constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
-constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL; // Corrected to const char*
-constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
+// 周囲にAPが見つからなかったときのフォールバック。
+// 通常は起動時のスキャンで最も強いAPのチャンネル1つに絞る（pick_dpp_listen_channel）
+constexpr char DPP_FALLBACK_CHANNEL_LIST[] = "1,6,11";
+constexpr const char *DPP_DEVICE_INFO = NULL; // 任意のデバイス情報（シリアル番号など）
+
+// ブートストラップの秘密鍵。NULLにするとESP-IDFが起動ごとにランダム生成する。
+// ここに固定値を書くと、公開リポジトリでは秘密鍵が公開されることになり、
+// 第三者がこのデバイスになりすましてWi-Fi認証情報を受け取れてしまう
+constexpr const char *DPP_BOOTSTRAPPING_KEY = NULL;
+
 static const char *TAG = "wifi dpp-enrollee";
 
 // Wi-Fi and DPP variables
@@ -686,11 +692,53 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
   }
 }
 
-esp_err_t dpp_enrollee_bootstrap()
+// DPPのリッスンチャンネルを決める。
+//
+// esp_supp_dpp_start_listen() はチャンネルリストの各チャンネルを一定時間ずつ
+// 巡回して待つ。一方Configurator（スマホ）はAPと同じチャンネルに居るため、
+// リストにAPのチャンネルが無いと、スマホ側もチャンネルを移動しながら
+// 巡回中のこちらを探すことになり、ランデブーに失敗しやすい。
+// 最も強いAPのチャンネル1つに絞れば、スマホは移動せずに済み、
+// こちらもそのチャンネルに留まって待てる。
+void pick_dpp_listen_channel(char *out, size_t out_len)
 {
-  const char *key = EXAMPLE_DPP_BOOTSTRAPPING_KEY;
-  return esp_supp_dpp_bootstrap_gen(EXAMPLE_DPP_LISTEN_CHANNEL_LIST, DPP_BOOTSTRAP_QR_CODE,
-                                    key, EXAMPLE_DPP_DEVICE_INFO);
+  snprintf(out, out_len, "%s", DPP_FALLBACK_CHANNEL_LIST);
+
+  int found = WiFi.scanNetworks();
+  if (found <= 0)
+  {
+    Serial.printf("DPP: no AP found, using fallback channels %s\n", out);
+    return;
+  }
+
+  int best = 0;
+  for (int i = 1; i < found; i++)
+  {
+    if (WiFi.RSSI(i) > WiFi.RSSI(best))
+    {
+      best = i;
+    }
+  }
+
+  int channel = WiFi.channel(best);
+  if (channel >= 1 && channel <= 14) // ESP32は2.4GHz帯のみ
+  {
+    snprintf(out, out_len, "%d", channel);
+    Serial.printf("DPP: listening on channel %d (strongest AP: %s, %d dBm)\n",
+                  channel, WiFi.SSID(best).c_str(), (int)WiFi.RSSI(best));
+  }
+  else
+  {
+    Serial.printf("DPP: unexpected channel %d, using fallback %s\n", channel, out);
+  }
+
+  WiFi.scanDelete();
+}
+
+esp_err_t dpp_enrollee_bootstrap(const char *chan_list)
+{
+  return esp_supp_dpp_bootstrap_gen(chan_list, DPP_BOOTSTRAP_QR_CODE,
+                                    DPP_BOOTSTRAPPING_KEY, DPP_DEVICE_INFO);
 }
 
 // DPPのリッスンを開始する。
@@ -716,6 +764,11 @@ bool dpp_start_listen()
   WiFi.disconnect(false, false);
   delay(200);
 
+  // リッスンするチャンネルを決める。スキャンイベントが自前ハンドラに
+  // 流れ込まないよう、登録前に済ませておく
+  char chan_list[16];
+  pick_dpp_listen_channel(chan_list, sizeof(chan_list));
+
   esp_err_t err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
   if (err == ESP_OK)
   {
@@ -727,7 +780,7 @@ bool dpp_start_listen()
   }
   if (err == ESP_OK)
   {
-    err = dpp_enrollee_bootstrap();
+    err = dpp_enrollee_bootstrap(chan_list);
   }
   if (err == ESP_OK)
   {
