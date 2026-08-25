@@ -540,19 +540,7 @@ WifiConnectResult connect_to_wifi()
 void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
   // Handle Wi-Fi and IP events
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-  {
-    // 通常このハンドラを登録した時点でSTA_STARTは発火済みだが、
-    // 再起動した場合に備えて残しておく（失敗してもabortしない）
-    esp_err_t err = esp_supp_dpp_start_listen();
-    if (err != ESP_OK)
-    {
-      ESP_LOGW(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
-      return;
-    }
-    ESP_LOGI(TAG, "Started listening for DPP Authentication");
-  }
-  else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
   {
     // DPPの認証情報を受け取る前は、リッスン中のチャンネルホッピングを
     // 邪魔しないよう再接続を試みない
@@ -597,6 +585,25 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     if (data != NULL)
     {
       ESP_LOGI(TAG, "DPP URI received: %s", (const char *)data);
+
+      // リッスンの開始は必ずここで行う。
+      // esp_supp_dpp_bootstrap_gen() は非同期で、DPPタスクがブートストラップ鍵を
+      // 生成し終えて初めて内部ID (s_dpp_ctx.id) が確定する。確定前に
+      // esp_supp_dpp_start_listen() を呼ぶと ESP_FAIL で弾かれる。
+      // 鍵をランダム生成にすると生成だけで6秒以上かかるため、
+      // bootstrap_gen() の直後に呼ぶと100%失敗する。
+      // このURI_READYはIDF側がIDを確定させた直後に呼ぶので、ここが唯一安全な地点。
+      err = esp_supp_dpp_start_listen();
+      if (err != ESP_OK)
+      {
+        ESP_LOGE(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
+        xEventGroupSetBits(s_dpp_event_group, DPP_AUTH_FAIL_BIT);
+        break;
+      }
+      ESP_LOGI(TAG, "Started listening for DPP Authentication");
+
+      // 電子ペーパーの更新は十数秒かかりDPPタスクを止めるが、
+      // QRが出るまでスキャンはできないので実害はない
       currentLedStatus = LED_ON; // QRコード表示中
       epaperDisplay.displayQRCode((const char *)data);
       currentLedStatus = LED_BLINK_FAST; // 表示完了後はWi-Fi接続中に戻す
@@ -727,12 +734,8 @@ bool dpp_start_listen()
   }
   if (err == ESP_OK)
   {
+    // 非同期。完了はURI_READYコールバックで通知され、そこでリッスンを開始する
     err = dpp_enrollee_bootstrap(chan_list);
-  }
-  if (err == ESP_OK)
-  {
-    // WIFI_EVENT_STA_START はArduino側で発火済みなので自分で呼ぶ
-    err = esp_supp_dpp_start_listen();
   }
 
   if (err != ESP_OK)
@@ -741,7 +744,7 @@ bool dpp_start_listen()
     return false;
   }
 
-  Serial.println("DPP: listening for authentication.");
+  Serial.println("DPP: bootstrapping (QR code appears in a few seconds).");
   return true;
 }
 
