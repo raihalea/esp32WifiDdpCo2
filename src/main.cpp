@@ -5,9 +5,7 @@
 #include <GxEPD2_3C.h>
 #include <Fonts/FreeSansBoldOblique18pt7b.h>
 #include "SensirionI2CScd4x.h"
-#include "qrcode.h"
 #include "QRCodeGenerator.h"
-#include "mbedtls/aes.h"
 #include <time.h>
 
 extern "C"
@@ -20,7 +18,6 @@ extern "C"
 #include "esp_event.h"
 #include "esp_dpp.h"
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 }
 
@@ -53,9 +50,16 @@ constexpr int EPD_HEIGHT = 200;
 constexpr EventBits_t DPP_CONNECTED_BIT = BIT0;
 constexpr EventBits_t DPP_CONNECT_FAIL_BIT = BIT1;
 constexpr EventBits_t DPP_AUTH_FAIL_BIT = BIT2;
-constexpr int WIFI_MAX_RETRY_NUM = 3;
+constexpr int WIFI_MAX_RETRY_NUM = 3;        // DPP成功後の再接続リトライ回数
+constexpr int WIFI_CONNECT_RETRY_NUM = 10;   // NVS認証情報での接続待ちリトライ回数
+constexpr int WIFI_CONNECT_RETRY_MS = 500;   // 上記リトライの間隔
+constexpr int DPP_AUTH_MAX_RETRY_NUM = 10;   // DPP認証失敗時のリッスンやり直し回数
 constexpr int QR_VERSION = 7;
 constexpr unsigned long DPP_TIMEOUT_MS = 2 * 60 * 1000; // DPPプロビジョニングの待ち時間
+
+// センサー読み取りとDeep Sleep
+constexpr unsigned long SENSOR_READY_TIMEOUT_MS = 10000;         // SCD4xの測定完了待ち
+constexpr uint64_t SLEEP_DURATION_US = 5ULL * 60 * 1000 * 1000;  // 起床間隔（5分）
 
 // 周囲にAPが見つからなかったときのフォールバック。
 // 通常は起動時のスキャンで最も強いAPのチャンネル1つに絞る（pick_dpp_listen_channel）
@@ -74,12 +78,12 @@ wifi_config_t s_dpp_wifi_config;
 static int s_retry_num = 0;
 static bool s_dpp_cfg_received = false; // DPPで認証情報を受け取ったか
 static EventGroupHandle_t s_dpp_event_group;
-static SemaphoreHandle_t xQrSemaphore = NULL;
 
-#define MAX_SSID_LEN 32
-#define MAX_PASSWORD_LEN 64
-#define WIFI_SSID_KEY "wifi_ssid"
-#define WIFI_PASS_KEY "wifi_pass"
+// ESP-IDFの esp_wifi_types.h が MAX_SSID_LEN 等を #define しているため、名前を分ける
+constexpr size_t WIFI_SSID_MAX_LEN = 32;
+constexpr size_t WIFI_PASSWORD_MAX_LEN = 64;
+constexpr const char *WIFI_SSID_KEY = "wifi_ssid";
+constexpr const char *WIFI_PASS_KEY = "wifi_pass";
 
 // Deep Sleepをまたいで保持する状態（電源断ではクリアされる）
 RTC_DATA_ATTR bool rtc_enable_wifi_mode = true;
@@ -163,11 +167,11 @@ public:
 
   void displaySensorDataWithTimestamp(uint16_t co2, float temperature, float humidity)
   {
-    char timestamp[10] = "";
-    char co2Display[10], tempDisplay[10], humidityDisplay[10];
-    const char *unitCO2 = "ppm";
-    const char *unitTemp = "C";
-    const char *unitHumidity = "%";
+    // 湿度を99.9%に制限（"%4.1f" が5桁になって桁ずれするのを防ぐ）
+    if (humidity > 99.9f)
+    {
+      humidity = 99.9f;
+    }
 
     // 時刻を取得。
     // 既定のgetLocalTime()は時刻が未設定だと5秒ブロックするので、
@@ -175,48 +179,52 @@ public:
     // ESP32のRTCはDeep Sleepをまたいで時刻を保持するため、
     // Wi-Fiに繋がらなかった周回でも前回の同期結果を表示できる。
     struct tm timeinfo;
-    bool hasTimeInfo = getLocalTime(&timeinfo, 0);
+    const bool hasTimeInfo = getLocalTime(&timeinfo, 0);
+
+    // 表示する行を組み立てる。単位が空の行（時刻）は単位なしで中央寄せする
+    struct Row
+    {
+      char text[10];
+      const char *unit;
+    };
+    Row rows[4];
+    int rowCount = 0;
+
     if (hasTimeInfo)
     {
-      strftime(timestamp, sizeof(timestamp), "%H:%M", &timeinfo);
+      strftime(rows[rowCount].text, sizeof(rows[0].text), "%H:%M", &timeinfo);
+      rows[rowCount].unit = "";
+      rowCount++;
     }
+    snprintf(rows[rowCount].text, sizeof(rows[0].text), "%4u", co2);
+    rows[rowCount].unit = "ppm";
+    rowCount++;
+    snprintf(rows[rowCount].text, sizeof(rows[0].text), "%4.1f", temperature);
+    rows[rowCount].unit = "C";
+    rowCount++;
+    snprintf(rows[rowCount].text, sizeof(rows[0].text), "%4.1f", humidity);
+    rows[rowCount].unit = "%";
+    rowCount++;
 
-    // 湿度を99.9%に制限
-    if (humidity > 99.9)
-    {
-      humidity = 99.9;
-    }
-
-    // 表示データをフォーマット
-    snprintf(co2Display, sizeof(co2Display), "%4u", co2);
-    snprintf(tempDisplay, sizeof(tempDisplay), "%4.1f", temperature);
-    snprintf(humidityDisplay, sizeof(humidityDisplay), "%4.1f", humidity);
-
-    // フォント設定
+    // フォント設定（getTextBounds はフォント設定後でないと正しい寸法を返さない）
     display.setFont(&FreeSansBoldOblique18pt7b);
     display.setTextColor(GxEPD_BLACK);
 
-    // 各テキストの高さと幅を測定
+    constexpr uint16_t spacing = 20;   // 行間スペース
+    constexpr int16_t unitGap = 10;    // 数値と単位の間隔
+    constexpr int16_t unitWidth = 60;  // 単位ぶんの確保幅（中央寄せの補正用）
+
     int16_t tbx, tby;
     uint16_t tbw, tbh;
-    uint16_t spacing = 20; // 行間スペース
 
-    // 合計高さを計算
+    // 合計高さを測って、画面の縦中央から描き始める
     uint16_t totalHeight = 0;
-    if (hasTimeInfo)
+    for (int i = 0; i < rowCount; i++)
     {
-      display.getTextBounds(timestamp, 0, 0, &tbx, &tby, &tbw, &tbh);
-      totalHeight += tbh + spacing;
+      display.getTextBounds(rows[i].text, 0, 0, &tbx, &tby, &tbw, &tbh);
+      totalHeight += tbh + (i < rowCount - 1 ? spacing : 0);
     }
-    display.getTextBounds(co2Display, 0, 0, &tbx, &tby, &tbw, &tbh);
-    totalHeight += tbh + spacing;
-    display.getTextBounds(tempDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
-    totalHeight += tbh + spacing;
-    display.getTextBounds(humidityDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
-    totalHeight += tbh;
-
-    // 描画開始位置を計算
-    int16_t yOffset = (display.height() - totalHeight) / 2;
+    const int16_t yOffset = (display.height() - totalHeight) / 2;
 
     // フルウィンドウ描画設定
     display.setFullWindow();
@@ -226,44 +234,22 @@ public:
       display.fillScreen(GxEPD_WHITE);
       int16_t y = yOffset;
 
-      // 時刻表示
-      if (hasTimeInfo)
+      for (int i = 0; i < rowCount; i++)
       {
-        display.getTextBounds(timestamp, 0, 0, &tbx, &tby, &tbw, &tbh);
-        display.setCursor((display.width() - tbw) / 2, y + tbh);
-        display.print(timestamp);
+        const bool hasUnit = (rows[i].unit[0] != '\0');
+        display.getTextBounds(rows[i].text, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+        const int16_t valueX = (display.width() - tbw - (hasUnit ? unitWidth : 0)) / 2;
+        display.setCursor(valueX, y + tbh);
+        display.print(rows[i].text);
+
+        if (hasUnit)
+        {
+          display.setCursor(valueX + tbw + unitGap, y + tbh);
+          display.print(rows[i].unit);
+        }
         y += tbh + spacing;
       }
-
-      // CO2表示（数値と単位を分けて描画）
-      display.getTextBounds(co2Display, 0, 0, &tbx, &tby, &tbw, &tbh);
-      int16_t valueX = (display.width() - tbw - 60) / 2; // 数値を中央に配置
-      int16_t unitX = valueX + tbw + 10;                 // 単位を数値の右に配置
-      display.setCursor(valueX, y + tbh);
-      display.print(co2Display);
-      display.setCursor(unitX, y + tbh);
-      display.print(unitCO2);
-      y += tbh + spacing;
-
-      // 温度表示（数値と単位を分けて描画）
-      display.getTextBounds(tempDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
-      valueX = (display.width() - tbw - 60) / 2;
-      unitX = valueX + tbw + 10;
-      display.setCursor(valueX, y + tbh);
-      display.print(tempDisplay);
-      display.setCursor(unitX, y + tbh);
-      display.print(unitTemp);
-      y += tbh + spacing;
-
-      // 湿度表示（数値と単位を分けて描画）
-      display.getTextBounds(humidityDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
-      valueX = (display.width() - tbw - 60) / 2;
-      unitX = valueX + tbw + 10;
-      display.setCursor(valueX, y + tbh);
-      display.print(humidityDisplay);
-      display.setCursor(unitX, y + tbh);
-      display.print(unitHumidity);
-
     } while (display.nextPage());
     // nextPage() の最終ページで既にフル更新＋powerOffまで済んでいるので
     // ここで display.refresh() を呼ぶと同じ内容をもう一度フル更新してしまう
@@ -271,11 +257,10 @@ public:
 
     // シリアルモニタ出力（デバッグ用）
     Serial.println("Displayed sensor data with timestamp:");
-    if (hasTimeInfo)
+    for (int i = 0; i < rowCount; i++)
     {
-      Serial.printf("Time: %s\n", timestamp);
+      Serial.printf("%s %s\n", rows[i].text, rows[i].unit);
     }
-    Serial.printf("%s %s\n%s %s\n%s %s\n", co2Display, unitCO2, tempDisplay, unitTemp, humidityDisplay, unitHumidity);
   }
 
   void displayQRCode(const char *data)
@@ -333,16 +318,6 @@ public:
     ESP_LOGI(TAG, "QR code displayed on e-paper.");
   }
 
-  void clear()
-  {
-    display.setFullWindow();
-    display.firstPage();
-    do
-    {
-      display.fillScreen(GxEPD_WHITE);
-    } while (display.nextPage());
-  }
-
 private:
   GxEPD2_3C<GxEPD2_154_Z90c, 200> display;
 };
@@ -384,10 +359,9 @@ public:
     char errorMessage[256];
 
     // SCD4xは測定開始から最初のサンプルまで約5秒かかるので待つ
-    const unsigned long timeout_ms = 10000;
     unsigned long startTime = millis();
 
-    while (millis() - startTime < timeout_ms)
+    while (millis() - startTime < SENSOR_READY_TIMEOUT_MS)
     {
       error = scd4x.getDataReadyFlag(isDataReady);
       if (error)
@@ -477,12 +451,12 @@ bool read_wifi_credentials_from_nvs(char *ssid, size_t ssid_len, char *password,
 // 必ず終端付きのバッファへ写してから保存する。
 void save_wifi_credentials_to_nvs(const uint8_t *ssid, const uint8_t *password)
 {
-  char ssid_buf[MAX_SSID_LEN + 1];
-  char pass_buf[MAX_PASSWORD_LEN + 1];
-  memcpy(ssid_buf, ssid, MAX_SSID_LEN);
-  ssid_buf[MAX_SSID_LEN] = '\0';
-  memcpy(pass_buf, password, MAX_PASSWORD_LEN);
-  pass_buf[MAX_PASSWORD_LEN] = '\0';
+  char ssid_buf[WIFI_SSID_MAX_LEN + 1];
+  char pass_buf[WIFI_PASSWORD_MAX_LEN + 1];
+  memcpy(ssid_buf, ssid, WIFI_SSID_MAX_LEN);
+  ssid_buf[WIFI_SSID_MAX_LEN] = '\0';
+  memcpy(pass_buf, password, WIFI_PASSWORD_MAX_LEN);
+  pass_buf[WIFI_PASSWORD_MAX_LEN] = '\0';
 
   nvs_handle_t nvs_handle;
   esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
@@ -529,8 +503,8 @@ WifiConnectResult connect_to_wifi()
 {
   // nvs_get_str はNUL終端分の領域も要求するので +1 しておく
   // （SSID 32文字ちょうど / PSK 16進64文字ちょうどで INVALID_LENGTH になる）
-  char ssid[MAX_SSID_LEN + 1] = {0};
-  char password[MAX_PASSWORD_LEN + 1] = {0};
+  char ssid[WIFI_SSID_MAX_LEN + 1] = {0};
+  char password[WIFI_PASSWORD_MAX_LEN + 1] = {0};
 
   // NVSからWi-Fi認証情報を読み取る
   if (!read_wifi_credentials_from_nvs(ssid, sizeof(ssid), password, sizeof(password)))
@@ -544,9 +518,9 @@ WifiConnectResult connect_to_wifi()
   // 接続を試行
   Serial.println("Connecting to Wi-Fi...");
   int retry_count = 0;
-  while (WiFi.status() != WL_CONNECTED && retry_count < 10)
+  while (WiFi.status() != WL_CONNECTED && retry_count < WIFI_CONNECT_RETRY_NUM)
   {
-    delay(500);
+    delay(WIFI_CONNECT_RETRY_MS);
     Serial.print(".");
     retry_count++;
   }
@@ -560,32 +534,6 @@ WifiConnectResult connect_to_wifi()
   {
     Serial.println("\nFailed to connect to Wi-Fi.");
     return WIFI_RESULT_FAILED;
-  }
-}
-
-void generateQRCode(const char *data)
-{
-  if (xQrSemaphore == NULL)
-  {
-    xQrSemaphore = xSemaphoreCreateMutex();
-  }
-  if (xQrSemaphore == NULL)
-  {
-    ESP_LOGE(TAG, "Failed to create semaphore.");
-    return;
-  }
-
-  if (xSemaphoreTake(xQrSemaphore, portMAX_DELAY))
-  {
-    currentLedStatus = LED_ON; // QRコード表示中
-    epaperDisplay.displayQRCode(data);
-    currentLedStatus = LED_BLINK_FAST; // 表示完了後はWi-Fi接続中に戻す
-
-    xSemaphoreGive(xQrSemaphore);
-  }
-  else
-  {
-    ESP_LOGE(TAG, "Failed to take semaphore.");
   }
 }
 
@@ -649,11 +597,9 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     if (data != NULL)
     {
       ESP_LOGI(TAG, "DPP URI received: %s", (const char *)data);
-      generateQRCode((const char *)data);
-      // Additional code to display QR code in serial monitor (optional)
-      esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
-      ESP_LOGI(TAG, "Scan the QR Code to configure the enrollee:");
-      esp_qrcode_generate(&cfg, (const char *)data);
+      currentLedStatus = LED_ON; // QRコード表示中
+      epaperDisplay.displayQRCode((const char *)data);
+      currentLedStatus = LED_BLINK_FAST; // 表示完了後はWi-Fi接続中に戻す
     }
     break;
   case ESP_SUPP_DPP_CFG_RECVD:
@@ -669,7 +615,7 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     esp_wifi_connect();
     break;
   case ESP_SUPP_DPP_FAIL:
-    if (s_retry_num < 10)
+    if (s_retry_num < DPP_AUTH_MAX_RETRY_NUM)
     {
       ESP_LOGI(TAG, "DPP Auth failed (Reason: %s), retrying...", esp_err_to_name((int)data));
       esp_supp_dpp_stop_listen();
@@ -708,6 +654,7 @@ void pick_dpp_listen_channel(char *out, size_t out_len)
   if (found <= 0)
   {
     Serial.printf("DPP: no AP found, using fallback channels %s\n", out);
+    WiFi.scanDelete();
     return;
   }
 
@@ -829,35 +776,28 @@ bool dpp_enrollee_init()
 
   if (dpp_start_listen())
   {
-    unsigned long startTime = millis();
+    // 3つの結果ビットのどれかが立つまで、最大DPP_TIMEOUT_MSブロックする。
+    // タイムアウトで戻ってきたときは bits にどれも立っていない
+    EventBits_t bits = xEventGroupWaitBits(s_dpp_event_group,
+                                           DPP_CONNECTED_BIT | DPP_CONNECT_FAIL_BIT | DPP_AUTH_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(DPP_TIMEOUT_MS));
 
-    while (millis() - startTime < DPP_TIMEOUT_MS)
+    if (bits & DPP_CONNECTED_BIT)
     {
-      EventBits_t bits = xEventGroupWaitBits(s_dpp_event_group,
-                                             DPP_CONNECTED_BIT | DPP_CONNECT_FAIL_BIT | DPP_AUTH_FAIL_BIT,
-                                             pdFALSE,
-                                             pdFALSE,
-                                             100 / portTICK_PERIOD_MS); // 100ms間隔で確認
-
-      if (bits & DPP_CONNECTED_BIT)
-      {
-        ESP_LOGI(TAG, "Connected to AP SSID:%s", s_dpp_wifi_config.sta.ssid);
-        connectionEstablished = true;
-        break;
-      }
-      if (bits & DPP_CONNECT_FAIL_BIT)
-      {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s", s_dpp_wifi_config.sta.ssid);
-        break;
-      }
-      if (bits & DPP_AUTH_FAIL_BIT)
-      {
-        ESP_LOGI(TAG, "DPP Authentication failed after %d retries", s_retry_num);
-        break;
-      }
+      ESP_LOGI(TAG, "Connected to AP SSID:%s", s_dpp_wifi_config.sta.ssid);
+      connectionEstablished = true;
     }
-
-    if (!connectionEstablished && millis() - startTime >= DPP_TIMEOUT_MS)
+    else if (bits & DPP_CONNECT_FAIL_BIT)
+    {
+      ESP_LOGI(TAG, "Failed to connect to SSID:%s", s_dpp_wifi_config.sta.ssid);
+    }
+    else if (bits & DPP_AUTH_FAIL_BIT)
+    {
+      ESP_LOGI(TAG, "DPP Authentication failed after %d retries", s_retry_num);
+    }
+    else
     {
       ESP_LOGI(TAG, "DPP timeout.");
     }
@@ -883,12 +823,6 @@ bool dpp_enrollee_init()
 // NTP
 void sync_ntp()
 {
-  if (!rtc_enable_wifi_mode)
-  {
-    Serial.println("Wi-Fi disabled mode: Skipping NTP synchronization.");
-    return;
-  }
-
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   Serial.println("Time synchronization started.");
 
@@ -927,7 +861,7 @@ void sensorTask(void *pvParameters)
 
   // Deep Sleepに移行（5分後に復帰）
   currentLedStatus = LED_OFF;
-  esp_sleep_enable_timer_wakeup(5 * 60 * 1000000); // 5分
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
   Serial.println("Entering Deep Sleep...");
   esp_deep_sleep_start();
 }
