@@ -582,32 +582,39 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
   switch (event)
   {
   case ESP_SUPP_DPP_URI_READY:
-    if (data != NULL)
+    // IDFは dpp_bootstrap_get_uri() の結果をNULLチェックせずそのまま渡してくる。
+    // ブートストラップ自体が失敗するとNULLで届くので、ここで諦めないと
+    // リッスンが始まらないままDPP_TIMEOUT_MS（2分）を丸ごと待つことになる
+    if (data == NULL)
     {
-      ESP_LOGI(TAG, "DPP URI received: %s", (const char *)data);
-
-      // リッスンの開始は必ずここで行う。
-      // esp_supp_dpp_bootstrap_gen() は非同期で、DPPタスクがブートストラップ鍵を
-      // 生成し終えて初めて内部ID (s_dpp_ctx.id) が確定する。確定前に
-      // esp_supp_dpp_start_listen() を呼ぶと ESP_FAIL で弾かれる。
-      // 鍵をランダム生成にすると生成だけで6秒以上かかるため、
-      // bootstrap_gen() の直後に呼ぶと100%失敗する。
-      // このURI_READYはIDF側がIDを確定させた直後に呼ぶので、ここが唯一安全な地点。
-      err = esp_supp_dpp_start_listen();
-      if (err != ESP_OK)
-      {
-        ESP_LOGE(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
-        xEventGroupSetBits(s_dpp_event_group, DPP_AUTH_FAIL_BIT);
-        break;
-      }
-      ESP_LOGI(TAG, "Started listening for DPP Authentication");
-
-      // 電子ペーパーの更新は十数秒かかりDPPタスクを止めるが、
-      // QRが出るまでスキャンはできないので実害はない
-      currentLedStatus = LED_ON; // QRコード表示中
-      epaperDisplay.displayQRCode((const char *)data);
-      currentLedStatus = LED_BLINK_FAST; // 表示完了後はWi-Fi接続中に戻す
+      ESP_LOGE(TAG, "DPP bootstrap failed (URI is NULL).");
+      xEventGroupSetBits(s_dpp_event_group, DPP_AUTH_FAIL_BIT);
+      break;
     }
+
+    ESP_LOGI(TAG, "DPP URI received: %s", (const char *)data);
+
+    // リッスンの開始は必ずここで行う。
+    // esp_supp_dpp_bootstrap_gen() は非同期で、DPPタスクがブートストラップ鍵を
+    // 生成し終えて初めて内部ID (s_dpp_ctx.id) が確定する。確定前に
+    // esp_supp_dpp_start_listen() を呼ぶと ESP_FAIL で弾かれる。
+    // 鍵をランダム生成にすると生成だけで6秒以上かかるため、
+    // bootstrap_gen() の直後に呼ぶと100%失敗する。
+    // このURI_READYはIDF側がIDを確定させた直後に呼ぶので、ここが唯一安全な地点。
+    err = esp_supp_dpp_start_listen();
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
+      xEventGroupSetBits(s_dpp_event_group, DPP_AUTH_FAIL_BIT);
+      break;
+    }
+    ESP_LOGI(TAG, "Started listening for DPP Authentication");
+
+    // 電子ペーパーの更新は十数秒かかりDPPタスクを止めるが、
+    // QRが出るまでスキャンはできないので実害はない
+    currentLedStatus = LED_ON; // QRコード表示中
+    epaperDisplay.displayQRCode((const char *)data);
+    currentLedStatus = LED_BLINK_FAST; // 表示完了後はWi-Fi接続中に戻す
     break;
   case ESP_SUPP_DPP_CFG_RECVD:
     memcpy(&s_dpp_wifi_config, data, sizeof(s_dpp_wifi_config));
