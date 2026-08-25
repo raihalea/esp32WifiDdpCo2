@@ -3,7 +3,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <GxEPD2_3C.h>
-#include <Fonts/FreeMonoBold9pt7b.h>
+#include <Fonts/FreeSansBoldOblique18pt7b.h>
 #include "SensirionI2CScd4x.h"
 #include "qrcode.h"
 #include "QRCodeGenerator.h"
@@ -26,45 +26,13 @@ extern "C"
 
 // LEDインジケーター
 #define LED_PIN 2
-
-// 電子ペーパー
-constexpr int EPD_WIDTH = 200;
-constexpr int EPD_HEIGHT = 200;
-
-// Wi-Fi and DPP
-constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
-constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL;
-constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
-static const char *TAG = "wifi dpp-enrollee";
-
-constexpr EventBits_t DPP_CONNECTED_BIT = BIT0;
-constexpr EventBits_t DPP_CONNECT_FAIL_BIT = BIT1;
-constexpr EventBits_t DPP_AUTH_FAIL_BIT = BIT2;
-constexpr int WIFI_MAX_RETRY_NUM = 3;
-constexpr int QR_VERSION = 7;
-constexpr int CURVE_SEC256R1_PKEY_HEX_DIGITS = 64;
-
-wifi_config_t s_dpp_wifi_config;
-static int s_retry_num = 0;
-static EventGroupHandle_t s_dpp_event_group;
-static SemaphoreHandle_t xQrSemaphore = NULL;
-
-#define MAX_SSID_LEN 32
-#define MAX_PASSWORD_LEN 64
-RTC_DATA_ATTR char rtc_ssid[MAX_SSID_LEN] = {0};
-RTC_DATA_ATTR char rtc_password[MAX_PASSWORD_LEN] = {0};
-RTC_DATA_ATTR bool rtc_credentials_saved = false;
-RTC_DATA_ATTR bool rtc_enable_wifi_mode = true;
-
-// NTP
-const char *ntpServer = "ntp.nict.jp"; // NTPサーバー
-const long gmtOffset_sec = 3600 * 9;   // GMT+9
-const int daylightOffset_sec = 0;      // サマータイムオフセット
-
-// Forward declarations (without static)
-void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
-void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data);
-
+#define PWM_CHANNEL 0       // PWMチャンネル（0～15）
+#define PWM_FREQUENCY 5000  // PWM周波数（5000Hz）
+#define PWM_RESOLUTION 8    // 分解能（8ビット: 0～255）
+#define LED_MODE_OFF 0      // LEDがオフ
+#define LED_MODE_NORMAL 24  // 標準的な明るさ
+#define LED_MODE_BRIGHT 128 // 明るいモード
+#define LED_MODE_MAX 255    // 最大明るさ
 enum LedStatus
 {
   LED_OFF,
@@ -77,53 +45,97 @@ enum LedStatus
 
 volatile LedStatus currentLedStatus = LED_OFF;
 
+// 電子ペーパー
+constexpr int EPD_WIDTH = 200;
+constexpr int EPD_HEIGHT = 200;
+
+// WiFi
+constexpr EventBits_t DPP_CONNECTED_BIT = BIT0;
+constexpr EventBits_t DPP_CONNECT_FAIL_BIT = BIT1;
+constexpr EventBits_t DPP_AUTH_FAIL_BIT = BIT2;
+constexpr int WIFI_MAX_RETRY_NUM = 3;
+constexpr int QR_VERSION = 7;
+constexpr int CURVE_SEC256R1_PKEY_HEX_DIGITS = 64;
+constexpr unsigned long DPP_TIMEOUT_MS = 2 * 60 * 1000; // DPPプロビジョニングの待ち時間
+
+constexpr char EXAMPLE_DPP_LISTEN_CHANNEL_LIST[] = "1,6,8";
+constexpr const char *EXAMPLE_DPP_DEVICE_INFO = NULL; // Corrected to const char*
+constexpr char EXAMPLE_DPP_BOOTSTRAPPING_KEY[] = "7a2bee1249c952518cbffe5a3aac817323e645601667ed672d08065d6dcf1099";
+static const char *TAG = "wifi dpp-enrollee";
+
+// Wi-Fi and DPP variables
+wifi_config_t s_dpp_wifi_config;
+static int s_retry_num = 0;
+static bool s_dpp_cfg_received = false; // DPPで認証情報を受け取ったか
+static EventGroupHandle_t s_dpp_event_group;
+static SemaphoreHandle_t xQrSemaphore = NULL;
+
+#define MAX_SSID_LEN 32
+#define MAX_PASSWORD_LEN 64
+#define WIFI_SSID_KEY "wifi_ssid"
+#define WIFI_PASS_KEY "wifi_pass"
+
+// Deep Sleepをまたいで保持する状態（電源断ではクリアされる）
+RTC_DATA_ATTR bool rtc_enable_wifi_mode = true;
+
+// NTP
+const char *ntpServer = "ntp.nict.jp"; // NTPサーバー
+const long gmtOffset_sec = 3600 * 9;   // GMT+9
+const int daylightOffset_sec = 0;      // サマータイムオフセット
+
+// Forward declarations (without static)
+void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data);
+
 // LED制御タスク
 void ledTask(void *pvParameters)
 {
   pinMode(LED_PIN, OUTPUT);
+  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(LED_PIN, PWM_CHANNEL);
   while (true)
   {
     switch (currentLedStatus)
     {
     case LED_OFF:
-      digitalWrite(LED_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
       vTaskDelay(100 / portTICK_PERIOD_MS);
       break;
 
     case LED_BLINK_SLOW:
-      digitalWrite(LED_PIN, HIGH);
-      vTaskDelay(500 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
-      vTaskDelay(500 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
       break;
 
     case LED_BLINK_FAST:
-      digitalWrite(LED_PIN, HIGH);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_BRIGHT);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
       break;
 
     case LED_ON:
-      digitalWrite(LED_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, LED_MODE_MAX);
       vTaskDelay(100 / portTICK_PERIOD_MS);
       break;
 
     case LED_DPP_SUCCESS:
       for (int i = 0; i < 5; i++) // 短い点滅を5回
       {
-        digitalWrite(LED_PIN, HIGH);
+        ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
         vTaskDelay(50 / portTICK_PERIOD_MS);
-        digitalWrite(LED_PIN, LOW);
+        ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
         vTaskDelay(50 / portTICK_PERIOD_MS);
       }
       currentLedStatus = LED_OFF;
       break;
 
     case LED_DPP_FAIL:
-      digitalWrite(LED_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, LED_MODE_NORMAL);
       vTaskDelay(1000 / portTICK_PERIOD_MS);
-      digitalWrite(LED_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, LED_MODE_OFF);
       vTaskDelay(1000 / portTICK_PERIOD_MS);
       break;
     }
@@ -140,58 +152,119 @@ public:
   {
     display.epd2.selectSPI(spi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
     display.init();
-    display.setRotation(1);
-  }
-
-  void displayText(const char *text)
-  {
-    display.setFont(&FreeMonoBold9pt7b); // フォント設定
-    display.setTextColor(GxEPD_BLACK);   // テキストカラー設定
-
-    // テキストのバウンドサイズを計算
-    int16_t tbx, tby;
-    uint16_t tbw, tbh;
-    display.getTextBounds(text, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-    // テキストを中央に配置
-    uint16_t x = (display.width() - tbw) / 2;
-    uint16_t y = (display.height() - tbh) / 2;
-
-    display.setFullWindow(); // フルウィンドウ描画設定
-    display.firstPage();
-    do
-    {
-      display.fillScreen(GxEPD_WHITE); // 画面を白でクリア
-      display.setCursor(x, y);         // テキスト描画位置を設定
-      display.print(text);             // テキストを描画
-    } while (display.nextPage());
-
-    Serial.println("Displayed text on e-paper:");
-    Serial.println(text); // シリアルモニタへの出力
+    display.setRotation(3);
   }
 
   void displaySensorDataWithTimestamp(uint16_t co2, float temperature, float humidity)
   {
-    char displayData[200]; // 表示内容のバッファ
+    char timestamp[10] = "";
+    char co2Display[10], tempDisplay[10], humidityDisplay[10];
+    const char *unitCO2 = "ppm";
+    const char *unitTemp = "C";
+    const char *unitHumidity = "%";
 
+    // 時刻を取得
     struct tm timeinfo;
-    bool hasTimeInfo = rtc_enable_wifi_mode && getLocalTime(&timeinfo); // 時刻情報が利用可能か確認
-
+    bool hasTimeInfo = rtc_enable_wifi_mode && getLocalTime(&timeinfo);
     if (hasTimeInfo)
     {
-      char timeOnly[10];
-      strftime(timeOnly, sizeof(timeOnly), "%H:%M", &timeinfo); // 時間と分を取得
-      snprintf(displayData, sizeof(displayData), "Time: %s\nCO2: %u ppm\nTemp: %.1f C\nHumidity: %.1f %%",
-               timeOnly, co2, temperature, humidity);
-    }
-    else
-    {
-      snprintf(displayData, sizeof(displayData), "CO2: %u ppm\nTemp: %.1f C\nHumidity: %.1f %%",
-               co2, temperature, humidity);
+      strftime(timestamp, sizeof(timestamp), "%H:%M", &timeinfo);
     }
 
-    displayText(displayData);    // 電子ペーパーに描画
-    Serial.println(displayData); // シリアルモニタにも出力
+    // 湿度を99.9%に制限
+    if (humidity > 99.9)
+    {
+      humidity = 99.9;
+    }
+
+    // 表示データをフォーマット
+    snprintf(co2Display, sizeof(co2Display), "%4u", co2);
+    snprintf(tempDisplay, sizeof(tempDisplay), "%4.1f", temperature);
+    snprintf(humidityDisplay, sizeof(humidityDisplay), "%4.1f", humidity);
+
+    // フォント設定
+    display.setFont(&FreeSansBoldOblique18pt7b);
+    display.setTextColor(GxEPD_BLACK);
+
+    // 各テキストの高さと幅を測定
+    int16_t tbx, tby;
+    uint16_t tbw, tbh;
+    uint16_t spacing = 20; // 行間スペース
+
+    // 合計高さを計算
+    uint16_t totalHeight = 0;
+    if (hasTimeInfo)
+    {
+      display.getTextBounds(timestamp, 0, 0, &tbx, &tby, &tbw, &tbh);
+      totalHeight += tbh + spacing;
+    }
+    display.getTextBounds(co2Display, 0, 0, &tbx, &tby, &tbw, &tbh);
+    totalHeight += tbh + spacing;
+    display.getTextBounds(tempDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
+    totalHeight += tbh + spacing;
+    display.getTextBounds(humidityDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
+    totalHeight += tbh;
+
+    // 描画開始位置を計算
+    int16_t yOffset = (display.height() - totalHeight) / 2;
+
+    // フルウィンドウ描画設定
+    display.setFullWindow();
+    display.firstPage();
+    do
+    {
+      display.fillScreen(GxEPD_WHITE);
+      int16_t y = yOffset;
+
+      // 時刻表示
+      if (hasTimeInfo)
+      {
+        display.getTextBounds(timestamp, 0, 0, &tbx, &tby, &tbw, &tbh);
+        display.setCursor((display.width() - tbw) / 2, y + tbh);
+        display.print(timestamp);
+        y += tbh + spacing;
+      }
+
+      // CO2表示（数値と単位を分けて描画）
+      display.getTextBounds(co2Display, 0, 0, &tbx, &tby, &tbw, &tbh);
+      int16_t valueX = (display.width() - tbw - 60) / 2; // 数値を中央に配置
+      int16_t unitX = valueX + tbw + 10;                 // 単位を数値の右に配置
+      display.setCursor(valueX, y + tbh);
+      display.print(co2Display);
+      display.setCursor(unitX, y + tbh);
+      display.print(unitCO2);
+      y += tbh + spacing;
+
+      // 温度表示（数値と単位を分けて描画）
+      display.getTextBounds(tempDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
+      valueX = (display.width() - tbw - 60) / 2;
+      unitX = valueX + tbw + 10;
+      display.setCursor(valueX, y + tbh);
+      display.print(tempDisplay);
+      display.setCursor(unitX, y + tbh);
+      display.print(unitTemp);
+      y += tbh + spacing;
+
+      // 湿度表示（数値と単位を分けて描画）
+      display.getTextBounds(humidityDisplay, 0, 0, &tbx, &tby, &tbw, &tbh);
+      valueX = (display.width() - tbw - 60) / 2;
+      unitX = valueX + tbw + 10;
+      display.setCursor(valueX, y + tbh);
+      display.print(humidityDisplay);
+      display.setCursor(unitX, y + tbh);
+      display.print(unitHumidity);
+
+    } while (display.nextPage());
+
+    display.refresh();
+
+    // シリアルモニタ出力（デバッグ用）
+    Serial.println("Displayed sensor data with timestamp:");
+    if (hasTimeInfo)
+    {
+      Serial.printf("Time: %s\n", timestamp);
+    }
+    Serial.printf("%s %s\n%s %s\n%s %s\n", co2Display, unitCO2, tempDisplay, unitTemp, humidityDisplay, unitHumidity);
   }
 
   void displayQRCode(const char *data)
@@ -227,7 +300,7 @@ public:
       display.fillScreen(GxEPD_WHITE);
 
       // Calculate QR code pixel size
-      int moduleSize = 4;
+      int moduleSize = 4; // Each module is 4x4 pixels
       int qrSizePixels = qrcode.size * moduleSize;
 
       // Center the QR code
@@ -263,6 +336,7 @@ private:
   GxEPD2_3C<GxEPD2_154_Z90c, 200> display;
 };
 
+// Global instance of EpaperDisplay
 SPIClass hspi(HSPI);
 EpaperDisplay epaperDisplay;
 
@@ -295,11 +369,11 @@ public:
   bool readData(uint16_t &co2, float &temperature, float &humidity)
   {
     uint16_t error;
-    bool isDataReady;
+    bool isDataReady = false;
     char errorMessage[256];
 
-    // データ準備の最大待機時間
-    const unsigned long timeout_ms = 5000; // 5秒
+    // SCD4xは測定開始から最初のサンプルまで約5秒かかるので待つ
+    const unsigned long timeout_ms = 10000;
     unsigned long startTime = millis();
 
     while (millis() - startTime < timeout_ms)
@@ -333,6 +407,7 @@ public:
       Serial.print("Error trying to execute readMeasurement(): ");
       errorToString(error, errorMessage, 256);
       Serial.println(errorMessage);
+      return false;
     }
     if (co2 == 0)
     {
@@ -347,76 +422,98 @@ private:
   SensirionI2CScd4x scd4x;
 };
 
+// Global instance of CO2Sensor
 CO2Sensor co2Sensor;
 
-// RTCメモリにWi-Fi情報を保存
-void save_wifi_credentials_to_rtc(const char *ssid, const char *password)
+// DPP認証情報をNVSから読み取る
+bool read_wifi_credentials_from_nvs(char *ssid, size_t ssid_len, char *password, size_t pass_len)
 {
-  if (strlen(ssid) >= sizeof(rtc_ssid))
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+
+  if (err != ESP_OK)
   {
-    Serial.println("Warning: SSID is too long. It will be truncated.");
-  }
-  if (strlen(password) >= sizeof(rtc_password))
-  {
-    Serial.println("Warning: Password is too long. It will be truncated.");
+    ESP_LOGE(TAG, "Failed to open NVS handle");
+    return false;
   }
 
-  snprintf(rtc_ssid, MAX_SSID_LEN, "%s", ssid);
-  snprintf(rtc_password, MAX_PASSWORD_LEN, "%s", password);
+  // SSIDを読み込み
+  err = nvs_get_str(nvs_handle, WIFI_SSID_KEY, ssid, &ssid_len);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to read SSID");
+    nvs_close(nvs_handle);
+    return false;
+  }
 
-  rtc_credentials_saved = true;
-  Serial.println("Wi-Fi credentials saved to RTC memory.");
+  // パスワードを読み込み
+  err = nvs_get_str(nvs_handle, WIFI_PASS_KEY, password, &pass_len);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to read password");
+    nvs_close(nvs_handle);
+    return false;
+  }
+
+  nvs_close(nvs_handle);
+  return true;
 }
 
-// RTCメモリからWi-Fi情報を読み取る
-bool read_wifi_credentials_from_rtc(char *ssid, char *password)
+// DPP認証情報を保存
+void save_wifi_credentials_to_nvs(const char *ssid, const char *password)
 {
-  if (rtc_credentials_saved)
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+
+  if (err != ESP_OK)
   {
-    snprintf(ssid, MAX_SSID_LEN, "%s", rtc_ssid);
-    snprintf(password, MAX_PASSWORD_LEN, "%s", rtc_password);
-    Serial.println("Wi-Fi credentials loaded from RTC memory.");
-    return true;
+    ESP_LOGE(TAG, "Failed to open NVS handle");
+    return;
   }
-  Serial.println("No Wi-Fi credentials found in RTC memory.");
-  return false;
+
+  // SSIDとパスワードを保存
+  nvs_set_str(nvs_handle, WIFI_SSID_KEY, ssid);
+  nvs_set_str(nvs_handle, WIFI_PASS_KEY, password);
+  nvs_commit(nvs_handle);
+  nvs_close(nvs_handle);
+  Serial.printf("Wi-Fi credentials saved: SSID=%s\n", ssid);
 }
 
 // Wi-Fi接続を試行
 bool connect_to_wifi()
 {
-  char ssid[32] = {0};
-  char password[64] = {0};
+  char ssid[MAX_SSID_LEN] = {0};
+  char password[MAX_PASSWORD_LEN] = {0};
 
-  // RTCメモリからWi-Fi認証情報を取得
-  if (read_wifi_credentials_from_rtc(ssid, password))
+  // NVSからWi-Fi認証情報を読み取る
+  if (!read_wifi_credentials_from_nvs(ssid, sizeof(ssid), password, sizeof(password)))
   {
-    Serial.println("Trying to connect to Wi-Fi using RTC memory credentials...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-
-    // 接続を試行
-    int retry_count = 0;
-    while (WiFi.status() != WL_CONNECTED && retry_count < 10)
-    {
-      delay(500);
-      Serial.print(".");
-      retry_count++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      Serial.printf("\nConnected to Wi-Fi! IP: %s\n", WiFi.localIP().toString().c_str());
-      return true; // 接続成功
-    }
-    else
-    {
-      Serial.println("\nFailed to connect to Wi-Fi using RTC memory credentials.");
-    }
+    return false; // 認証情報がない場合は接続せず終了
   }
 
-  // RTCメモリにデータがない場合は接続失敗
-  return false;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  // 接続を試行
+  Serial.println("Connecting to Wi-Fi...");
+  int retry_count = 0;
+  while (WiFi.status() != WL_CONNECTED && retry_count < 10)
+  {
+    delay(500);
+    Serial.print(".");
+    retry_count++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.printf("\nConnected to Wi-Fi! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true; // 接続成功
+  }
+  else
+  {
+    Serial.println("\nFailed to connect to Wi-Fi.");
+    return false; // 接続失敗
+  }
 }
 
 void generateQRCode(const char *data)
@@ -450,11 +547,24 @@ void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, voi
   // Handle Wi-Fi and IP events
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
   {
-    ESP_ERROR_CHECK(esp_supp_dpp_start_listen());
+    // 通常このハンドラを登録した時点でSTA_STARTは発火済みだが、
+    // 再起動した場合に備えて残しておく（失敗してもabortしない）
+    esp_err_t err = esp_supp_dpp_start_listen();
+    if (err != ESP_OK)
+    {
+      ESP_LOGW(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
+      return;
+    }
     ESP_LOGI(TAG, "Started listening for DPP Authentication");
   }
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
   {
+    // DPPの認証情報を受け取る前は、リッスン中のチャンネルホッピングを
+    // 邪魔しないよう再接続を試みない
+    if (!s_dpp_cfg_received)
+    {
+      return;
+    }
     if (s_retry_num < WIFI_MAX_RETRY_NUM)
     {
       esp_wifi_connect();
@@ -484,6 +594,7 @@ void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, voi
 void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
 {
   wifi_config_t *config = NULL; // switch文の外で変数を宣言
+  esp_err_t err;
 
   switch (event)
   {
@@ -492,6 +603,7 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     {
       ESP_LOGI(TAG, "DPP URI received: %s", (const char *)data);
       generateQRCode((const char *)data);
+      // Additional code to display QR code in serial monitor (optional)
       esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
       ESP_LOGI(TAG, "Scan the QR Code to configure the enrollee:");
       esp_qrcode_generate(&cfg, (const char *)data);
@@ -499,13 +611,14 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     break;
   case ESP_SUPP_DPP_CFG_RECVD:
     memcpy(&s_dpp_wifi_config, data, sizeof(s_dpp_wifi_config));
+    // Wi-Fi設定をNVSに保存
     config = (wifi_config_t *)data;
-
-    save_wifi_credentials_to_rtc((const char *)config->sta.ssid, (const char *)config->sta.password);
+    save_wifi_credentials_to_nvs((const char *)config->sta.ssid, (const char *)config->sta.password);
 
     esp_wifi_set_config(WIFI_IF_STA, &s_dpp_wifi_config);
     ESP_LOGI(TAG, "DPP Authentication successful, connecting to AP: %s", s_dpp_wifi_config.sta.ssid);
     s_retry_num = 0;
+    s_dpp_cfg_received = true;
     esp_wifi_connect();
     break;
   case ESP_SUPP_DPP_FAIL:
@@ -513,7 +626,13 @@ void dpp_enrollee_event_cb(esp_supp_dpp_event_t event, void *data)
     {
       ESP_LOGI(TAG, "DPP Auth failed (Reason: %s), retrying...", esp_err_to_name((int)data));
       esp_supp_dpp_stop_listen();
-      ESP_ERROR_CHECK(esp_supp_dpp_start_listen());
+      err = esp_supp_dpp_start_listen();
+      if (err != ESP_OK)
+      {
+        ESP_LOGW(TAG, "esp_supp_dpp_start_listen failed: %s", esp_err_to_name(err));
+        xEventGroupSetBits(s_dpp_event_group, DPP_AUTH_FAIL_BIT);
+        break;
+      }
       s_retry_num++;
     }
     else
@@ -533,81 +652,138 @@ esp_err_t dpp_enrollee_bootstrap()
                                     key, EXAMPLE_DPP_DEVICE_INFO);
 }
 
+// DPPのリッスンを開始する。
+//
+// 注意: Arduinoの WiFi.mode()/WiFi.begin() は内部で esp_netif_init()・
+// esp_event_loop_create_default()・esp_netif_create_default_wifi_sta()・
+// esp_wifi_init()・esp_wifi_start() まで済ませてしまう。
+// ここでESP-IDF流にもう一度初期化すると ESP_ERR_INVALID_STATE を返し、
+// ESP_ERROR_CHECK が abort() → 再起動ループになる。
+// そのため初期化済みの状態をそのまま再利用し、DPPの開始だけを行う。
+bool dpp_start_listen()
+{
+  // 冪等。connect_to_wifi()が認証情報なしで即座に戻った場合はここで初期化される
+  if (!WiFi.mode(WIFI_STA))
+  {
+    Serial.println("DPP: failed to enter STA mode.");
+    return false;
+  }
+
+  // DPPリッスン中は自動再接続を止める（チャンネルホッピングと競合するため）。
+  // 切断イベントが自前ハンドラに届かないよう、登録前に済ませておく。
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  delay(200);
+
+  esp_err_t err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
+  if (err == ESP_OK)
+  {
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
+  }
+  if (err == ESP_OK)
+  {
+    err = esp_supp_dpp_init(dpp_enrollee_event_cb);
+  }
+  if (err == ESP_OK)
+  {
+    err = dpp_enrollee_bootstrap();
+  }
+  if (err == ESP_OK)
+  {
+    // WIFI_EVENT_STA_START はArduino側で発火済みなので自分で呼ぶ
+    err = esp_supp_dpp_start_listen();
+  }
+
+  if (err != ESP_OK)
+  {
+    Serial.printf("DPP: setup failed (%s)\n", esp_err_to_name(err));
+    return false;
+  }
+
+  Serial.println("DPP: listening for authentication.");
+  return true;
+}
+
 void cleanup_dpp_resources()
 {
   esp_supp_dpp_deinit();
-  ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
-  ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
-  vEventGroupDelete(s_dpp_event_group);
+  esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler);
+  esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
+  if (s_dpp_event_group != NULL)
+  {
+    vEventGroupDelete(s_dpp_event_group);
+    s_dpp_event_group = NULL;
+  }
 }
 
+// DPPでのプロビジョニングを試みる。
+// 失敗しても決してabortせず、Wi-Fiなしモードに落ちて呼び出し元に戻る
+// （センサー読み取りと電子ペーパー更新はWi-Fiに依存しないため）。
 void dpp_enrollee_init()
 {
   currentLedStatus = LED_BLINK_FAST; // Wi-Fi接続中
 
   s_dpp_event_group = xEventGroupCreate();
-
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-
-  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_supp_dpp_init(dpp_enrollee_event_cb));
-  ESP_ERROR_CHECK(dpp_enrollee_bootstrap());
-  ESP_ERROR_CHECK(esp_wifi_start());
-
-  // タイムアウト設定
-  unsigned long startTime = millis();          // タイマーの開始時間
-  const unsigned long timeout = 2 * 60 * 1000; // タイムアウト時間（2分）
+  if (s_dpp_event_group == NULL)
+  {
+    Serial.println("DPP: failed to create event group.");
+    rtc_enable_wifi_mode = false;
+    return;
+  }
 
   bool connectionEstablished = false;
 
-  while (millis() - startTime < timeout)
+  if (dpp_start_listen())
   {
-    // Wi-Fi接続イベントを監視
-    EventBits_t bits = xEventGroupWaitBits(s_dpp_event_group,
-                                           DPP_CONNECTED_BIT | DPP_CONNECT_FAIL_BIT | DPP_AUTH_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           100 / portTICK_PERIOD_MS); // 100ms間隔で確認
+    unsigned long startTime = millis();
 
-    if (bits & DPP_CONNECTED_BIT)
+    while (millis() - startTime < DPP_TIMEOUT_MS)
     {
-      ESP_LOGI(TAG, "Connected to AP SSID:%s", s_dpp_wifi_config.sta.ssid);
-      connectionEstablished = true;
-      break;
+      EventBits_t bits = xEventGroupWaitBits(s_dpp_event_group,
+                                             DPP_CONNECTED_BIT | DPP_CONNECT_FAIL_BIT | DPP_AUTH_FAIL_BIT,
+                                             pdFALSE,
+                                             pdFALSE,
+                                             100 / portTICK_PERIOD_MS); // 100ms間隔で確認
+
+      if (bits & DPP_CONNECTED_BIT)
+      {
+        ESP_LOGI(TAG, "Connected to AP SSID:%s", s_dpp_wifi_config.sta.ssid);
+        connectionEstablished = true;
+        break;
+      }
+      if (bits & DPP_CONNECT_FAIL_BIT)
+      {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s", s_dpp_wifi_config.sta.ssid);
+        break;
+      }
+      if (bits & DPP_AUTH_FAIL_BIT)
+      {
+        ESP_LOGI(TAG, "DPP Authentication failed after %d retries", s_retry_num);
+        break;
+      }
     }
-    if (bits & DPP_CONNECT_FAIL_BIT)
+
+    if (!connectionEstablished && millis() - startTime >= DPP_TIMEOUT_MS)
     {
-      ESP_LOGI(TAG, "Failed to connect to SSID:%s", s_dpp_wifi_config.sta.ssid);
-      break;
+      ESP_LOGI(TAG, "DPP timeout.");
     }
-    if (bits & DPP_AUTH_FAIL_BIT)
-    {
-      ESP_LOGI(TAG, "DPP Authentication failed after %d retries", s_retry_num);
-      break;
-    }
+    esp_supp_dpp_stop_listen();
   }
 
   if (!connectionEstablished)
   {
-    if (millis() - startTime >= timeout)
-    {
-      ESP_LOGI(TAG, "DPP timeout. Switching to Wi-Fi disabled mode.");
-    }
+    ESP_LOGI(TAG, "Switching to Wi-Fi disabled mode.");
     rtc_enable_wifi_mode = false;    // Wi-Fiなしモードを有効化
     currentLedStatus = LED_DPP_FAIL; // DPP失敗
-    esp_supp_dpp_stop_listen();      // DPPリスニング停止
-    esp_wifi_stop();                 // Wi-Fiモジュール停止
   }
 
   // リソース解放
   cleanup_dpp_resources();
+
+  if (!connectionEstablished)
+  {
+    WiFi.mode(WIFI_OFF); // Wi-Fiモジュール停止
+  }
 }
 
 // NTP
@@ -632,13 +808,13 @@ void sync_ntp()
   Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
 }
 
+// タスクハンドラ
 TaskHandle_t sensorTaskHandle = NULL;
 
+// センサーとe-paper更新用のタスク
 void sensorTask(void *pvParameters)
 {
-  // Initialize CO₂ sensor
-  co2Sensor.init();
-
+  // センサーからデータを取得
   uint16_t co2;
   float temperature, humidity;
 
@@ -646,6 +822,7 @@ void sensorTask(void *pvParameters)
 
   if (co2Sensor.readData(co2, temperature, humidity))
   {
+    // センサーのデータを表示
     Serial.printf("CO2: %u ppm, Temp: %.1f C, Humidity: %.1f %%\n", co2, temperature, humidity);
     epaperDisplay.displaySensorDataWithTimestamp(co2, temperature, humidity);
   }
@@ -654,20 +831,21 @@ void sensorTask(void *pvParameters)
     Serial.println("Failed to read sensor data.");
   }
 
-  currentLedStatus = LED_OFF; // Deep Sleepに移行
-
   // Deep Sleepに移行（5分後に復帰）
-  esp_sleep_enable_timer_wakeup(5 * 60 * 1000000);
+  currentLedStatus = LED_OFF;
+  esp_sleep_enable_timer_wakeup(5 * 60 * 1000000); // 5分
   Serial.println("Entering Deep Sleep...");
   esp_deep_sleep_start();
 }
 
+// Arduino setup function
 void setup()
 {
   Serial.begin(115200);
 
   xTaskCreatePinnedToCore(ledTask, "LED Task", 2048, NULL, 1, NULL, APP_CPU_NUM);
 
+  // NVSの初期化
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
   {
@@ -690,7 +868,10 @@ void setup()
   hspi.begin(13, 12, 14, 15);
   epaperDisplay.init(hspi);
 
-  // Wi-Fi接続試行
+  // Initialize CO₂ sensor
+  co2Sensor.init();
+
+  // Wi-Fi接続試行。ここでの失敗はすべて許容し、必ずsensorTaskまで到達させる
   if (rtc_enable_wifi_mode)
   {
     if (!connect_to_wifi())
