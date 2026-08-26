@@ -326,6 +326,43 @@ private:
 SPIClass hspi(HSPI);
 EpaperDisplay epaperDisplay;
 
+// SCD40の自己発熱ぶんを差し引く量。基準温度計と並べて同時測定し、
+// (センサー値 - 基準値) の平均を入れる。設置場所や筐体を変えたら測り直すこと。
+//
+// 適用範囲と既知の限界:
+// この値は室温26〜28度で校正してある。自己発熱量は室温によって変わるため、
+// 全域では合わない。Nature Remo を基準に実測した結果は以下のとおり。
+//
+//   室温26.0度 -> 自己発熱2.70 (n=6,  標準偏差0.10)  この定数での誤差 +0.30
+//   室温27.6度 -> 自己発熱2.07 (n=9,  標準偏差0.22)  この定数での誤差 -0.33
+//   室温33.3度 -> 自己発熱4.38 (n=10, 標準偏差0.15)  この定数での誤差 +1.98
+//
+// 各測定の標準偏差が0.1〜0.2と小さいので、この差は測定ノイズではない。
+// ただし26.0度と27.6度で自己発熱量が逆転しており、単純な温度依存では表せない
+// （一次近似の残差が +0.47/-0.61/+0.14 と揃わない）。原因は未解明。
+// 冷暖房のある部屋の常用域(24〜30度)では誤差±0.4度程度に収まるため、
+// 定数で割り切っている。真夏に窓を開けた33度のような条件では最大2度ずれる。
+//
+// なお基準に使ったNature Remo自体も精度保証のある測定器ではない。
+// 絶対湿度が常に3 g/m3ほど食い違っており、どちらが真値かは確定できていない。
+//
+// なぜセンサー内蔵の温度オフセット機能を使わないか:
+// 起床のたびに stopPeriodicMeasurement() → startPeriodicMeasurement() して
+// 最初のサンプルを読む今の使い方では、内蔵オフセットが適用されない。
+// 実測では、オフセットを 0 / 6.1 / 12.0 と振っても1サンプル目は
+// 28.85 / 28.89 / 28.97 とほぼ不変で、2・3サンプル目にかけて徐々に効き始める
+// （12.0 の場合 28.97 → 28.13 → 27.24 で、15秒経ってもまだ収束しない）。
+// 5分周期で20秒だけ起きる運用では収束を待てないため、ソフト側で引く。
+//
+// 注意: センサーのEEPROMには現在 6.10 が書かれているが、上記の理由で使われていない。
+constexpr float TEMP_SELF_HEATING_C = 2.4f;
+
+// 飽和水蒸気圧 [hPa]（Magnusの式）。湿度の補正に使う
+static float saturationVaporPressure(float tempC)
+{
+  return 6.112f * expf(17.67f * tempC / (tempC + 243.5f));
+}
+
 // CO₂ sensor class
 class CO2Sensor
 {
@@ -335,20 +372,32 @@ public:
   void init()
   {
     Wire.begin();
-    uint16_t error;
-
     scd4x.begin(Wire);
-    error = scd4x.stopPeriodicMeasurement();
+
+    // stopに失敗しても続行する。ここでreturnするとstartPeriodicMeasurement()が
+    // 呼ばれず、Deep Sleep中も動き続けているセンサーから「収束済み」のサンプルを
+    // 読むことになる。その値には内蔵オフセットが効いているため、
+    // ソフト側の補正と二重にかかって表示が6度ほど低くなる。
+    uint16_t error = scd4x.stopPeriodicMeasurement();
     if (error)
     {
       Serial.println("Error stopping measurement");
-      return;
     }
+
+    // 内蔵の温度オフセットは使わない（TEMP_SELF_HEATING_C のコメント参照）。
+    // EEPROMに何が入っていても——新品なら工場出荷値の4.0——毎回0で上書きし、
+    // 補正がソフト側の一箇所だけになるようにする。EEPROMには書かない
+    // （書換寿命があるうえ、起動パスに置くと5分ごとに消費してしまう）。
+    error = scd4x.setTemperatureOffset(0.0f);
+    if (error)
+    {
+      Serial.println("Error setting temperature offset");
+    }
+
     error = scd4x.startPeriodicMeasurement();
     if (error)
     {
       Serial.println("Error starting measurement");
-      return;
     }
   }
 
@@ -399,6 +448,19 @@ public:
       Serial.println("Invalid sample detected");
       return false;
     }
+
+    // 自己発熱の補正。温度を下げると、同じ空気でも相対湿度は上がる
+    // （絶対湿度は変わらないため）。RH_周囲 = RH_生 * es(T_生) / es(T_周囲)
+    const float rawTemperature = temperature;
+    const float rawHumidity = humidity;
+    temperature = rawTemperature - TEMP_SELF_HEATING_C;
+    humidity = rawHumidity * saturationVaporPressure(rawTemperature) / saturationVaporPressure(temperature);
+    if (humidity > 100.0f)
+    {
+      humidity = 100.0f;
+    }
+    Serial.printf("Sensor raw: %.2f C, %.1f %% -> corrected: %.2f C, %.1f %%\n",
+                  rawTemperature, rawHumidity, temperature, humidity);
 
     return true;
   }
