@@ -326,6 +326,26 @@ private:
 SPIClass hspi(HSPI);
 EpaperDisplay epaperDisplay;
 
+// SCD40の自己発熱ぶんを差し引く量。基準温度計と並べて同時測定し、
+// (センサー値 - 基準値) の平均を入れる。設置場所や筐体を変えたら測り直すこと。
+//
+// なぜセンサー内蔵の温度オフセット機能を使わないか:
+// 起床のたびに stopPeriodicMeasurement() → startPeriodicMeasurement() して
+// 最初のサンプルを読む今の使い方では、内蔵オフセットが適用されない。
+// 実測では、オフセットを 0 / 6.1 / 12.0 と振っても1サンプル目は
+// 28.85 / 28.89 / 28.97 とほぼ不変で、2・3サンプル目にかけて徐々に効き始める
+// （12.0 の場合 28.97 → 28.13 → 27.24 で、15秒経ってもまだ収束しない）。
+// 5分周期で20秒だけ起きる運用では収束を待てないため、ソフト側で引く。
+//
+// 注意: センサーのEEPROMには現在 6.10 が書かれているが、上記の理由で使われていない。
+constexpr float TEMP_SELF_HEATING_C = 2.4f;
+
+// 飽和水蒸気圧 [hPa]（Magnusの式）。湿度の補正に使う
+static float saturationVaporPressure(float tempC)
+{
+  return 6.112f * expf(17.67f * tempC / (tempC + 243.5f));
+}
+
 // CO₂ sensor class
 class CO2Sensor
 {
@@ -399,6 +419,19 @@ public:
       Serial.println("Invalid sample detected");
       return false;
     }
+
+    // 自己発熱の補正。温度を下げると、同じ空気でも相対湿度は上がる
+    // （絶対湿度は変わらないため）。RH_周囲 = RH_生 * es(T_生) / es(T_周囲)
+    const float rawTemperature = temperature;
+    const float rawHumidity = humidity;
+    temperature = rawTemperature - TEMP_SELF_HEATING_C;
+    humidity = rawHumidity * saturationVaporPressure(rawTemperature) / saturationVaporPressure(temperature);
+    if (humidity > 100.0f)
+    {
+      humidity = 100.0f;
+    }
+    Serial.printf("Sensor raw: %.2f C, %.1f %% -> corrected: %.2f C, %.1f %%\n",
+                  rawTemperature, rawHumidity, temperature, humidity);
 
     return true;
   }
