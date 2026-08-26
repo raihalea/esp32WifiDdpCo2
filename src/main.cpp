@@ -372,20 +372,32 @@ public:
   void init()
   {
     Wire.begin();
-    uint16_t error;
-
     scd4x.begin(Wire);
-    error = scd4x.stopPeriodicMeasurement();
+
+    // stopに失敗しても続行する。ここでreturnするとstartPeriodicMeasurement()が
+    // 呼ばれず、Deep Sleep中も動き続けているセンサーから「収束済み」のサンプルを
+    // 読むことになる。その値には内蔵オフセットが効いているため、
+    // ソフト側の補正と二重にかかって表示が6度ほど低くなる。
+    uint16_t error = scd4x.stopPeriodicMeasurement();
     if (error)
     {
       Serial.println("Error stopping measurement");
-      return;
     }
+
+    // 内蔵の温度オフセットは使わない（TEMP_SELF_HEATING_C のコメント参照）。
+    // EEPROMに何が入っていても——新品なら工場出荷値の4.0——毎回0で上書きし、
+    // 補正がソフト側の一箇所だけになるようにする。EEPROMには書かない
+    // （書換寿命があるうえ、起動パスに置くと5分ごとに消費してしまう）。
+    error = scd4x.setTemperatureOffset(0.0f);
+    if (error)
+    {
+      Serial.println("Error setting temperature offset");
+    }
+
     error = scd4x.startPeriodicMeasurement();
     if (error)
     {
       Serial.println("Error starting measurement");
-      return;
     }
   }
 
