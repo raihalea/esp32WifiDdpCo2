@@ -90,8 +90,16 @@ RTC_DATA_ATTR bool rtc_enable_wifi_mode = true;
 
 // NTP
 const char *ntpServer = "ntp.nict.jp"; // NTPサーバー
-const long gmtOffset_sec = 3600 * 9;   // GMT+9
-const int daylightOffset_sec = 0;      // サマータイムオフセット
+
+// タイムゾーン（POSIX形式。JSTはUTCより9時間進むので符号は逆で "JST-9"）。
+// RTCが持つのはUTCで、ローカル時刻への変換はTZ環境変数を見て行われる。
+// TZはRAM上にあるためDeep Sleep復帰（＝再起動）のたびに消えるので、
+// NTP同期の有無にかかわらずsetup()で必ず設定し直すこと。
+constexpr const char *TZ_JST = "JST-9";
+
+// 5分周期がどこかで止まったときに強制的にDeep Sleepへ落とす見張りの待ち時間。
+// DPPのリッスン(2分)＋QRコード描画＋接続よりも長くとる
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Forward declarations (without static)
 void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -175,11 +183,13 @@ public:
 
     // 時刻を取得。
     // 既定のgetLocalTime()は時刻が未設定だと5秒ブロックするので、
-    // タイムアウト0を明示して即座に判定させる。
+    // 短いタイムアウトを明示して即座に判定させる。
+    // 0にしてはいけない。getLocalTime()の待ちループは while ((millis() - start) <= ms)
+    // なので、呼び出し中に1ms進むと判定を一度も行わずfalseを返し、時刻行が消える。
     // ESP32のRTCはDeep Sleepをまたいで時刻を保持するため、
     // Wi-Fiに繋がらなかった周回でも前回の同期結果を表示できる。
     struct tm timeinfo;
-    const bool hasTimeInfo = getLocalTime(&timeinfo, 0);
+    const bool hasTimeInfo = getLocalTime(&timeinfo, 1);
 
     // 表示する行を組み立てる。単位が空の行（時刻）は単位なしで中央寄せする
     struct Row
@@ -895,7 +905,8 @@ bool dpp_enrollee_init()
 // NTP
 void sync_ntp()
 {
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  // TZの指定はsetup()と同じ文字列を使う（configTime()の秒指定だと表現が二重になる）
+  configTzTime(TZ_JST, ntpServer);
   Serial.println("Time synchronization started.");
 
   struct tm timeinfo;
@@ -906,6 +917,20 @@ void sync_ntp()
   }
   Serial.println("Time synchronized:");
   Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+}
+
+// 見張りタスク。
+// I2Cバスのロックやドライバ内のブロックで5分周期が止まると、
+// タスクウォッチドッグはCONFIG_ESP_TASK_WDT_PANICが無効なため警告を出すだけで、
+// 誰もリセットしてくれない。ここで期限を切って次の周期へ復帰させる。
+// esp_restart()ではなくDeep Sleepにするのは、コールドブート扱いになって
+// DPP（QRコードを2分表示）へ寄り道するのを避けるため。
+// 正常フローが先にDeep Sleepへ入ればこのタスクごと消えるので後始末は不要。
+void watchdogTask(void *pvParameters)
+{
+  vTaskDelay(pdMS_TO_TICKS(WATCHDOG_TIMEOUT_MS));
+  Serial.println("Watchdog: stuck, forcing Deep Sleep.");
+  esp_deep_sleep(SLEEP_DURATION_US);
 }
 
 // タスクハンドラ
@@ -943,6 +968,15 @@ void setup()
 {
   Serial.begin(115200);
 
+  // TZはDeep Sleep復帰のたびに消えるので、NTP同期の有無にかかわらず毎回設定する。
+  // これを忘れると、Wi-Fiに繋がらなかった周回だけ表示がUTC（＝9時間前）になる
+  setenv("TZ", TZ_JST, 1);
+  tzset();
+
+  // 以降のどこでブロックしても復帰できるよう、初期化より先に見張りを起こしておく。
+  // 優先度はほかのタスクより高くして、ビジーループに邪魔されないようにする
+  xTaskCreatePinnedToCore(watchdogTask, "Watchdog", 2048, NULL, 2, NULL, APP_CPU_NUM);
+
   xTaskCreatePinnedToCore(ledTask, "LED Task", 2048, NULL, 1, NULL, APP_CPU_NUM);
 
   // NVSの初期化
@@ -954,8 +988,16 @@ void setup()
   }
   ESP_ERROR_CHECK(ret);
 
-  // Deep Sleepからの復帰か確認
-  const bool isColdBoot = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER);
+  // 起動要因を確認する。
+  // ここで欲しいのは「人が電源を抜き差しした（＝設定をやり直したい）」かどうかなので、
+  // 電源投入とリセットボタンだけをコールドブートとして扱う。
+  // 「タイマー起床以外は全部コールドブート」にしてしまうと、電圧降下による
+  // ブラウンアウト再起動やパニック再起動のたびにDPPへ入り、
+  // QRコードを2分間表示して5分周期を潰してしまう。
+  // リセット要因は固まったときの原因切り分けにも要るのでログに残す
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.printf("Reset reason: %d\n", (int)resetReason);
+  const bool isColdBoot = (resetReason == ESP_RST_POWERON || resetReason == ESP_RST_EXT);
   if (isColdBoot)
   {
     Serial.println("Fresh start...");
