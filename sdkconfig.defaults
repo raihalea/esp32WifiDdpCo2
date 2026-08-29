@@ -10,3 +10,12 @@ CONFIG_NEWLIB_LIBRARY_LEVEL_NORMAL=y
 CONFIG_NEWLIB_NANO_FORMAT=
 CONFIG_SSL_USING_MBEDTLS=y
 CONFIG_LWIP_IPV6=y
+# ブラウンアウト検出のしきい値。既定の LVL_SEL_0 は一番低い電圧なので、
+# USBの給電が細って電圧が落ちてもリセットがかからず、中途半端な電圧のまま
+# CPUが停止（＝固まる）しうる。高めにして、固まる代わりに再起動させる。
+# ここで再起動が頻発するようなら、それ自体が給電不足の証拠になる。
+# 注意: sdkconfig.esp32dev が既にある場合、そちらの値が優先されてこのファイルは
+# 反映されない。生成済みファイル側も同じ値に直してある（消して再生成すると
+# CONFIG_FREERTOS_HZ=1000 などArduino必須の設定が失われるので消さないこと）。
+CONFIG_ESP32_BROWNOUT_DET=y
+CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_4=y
