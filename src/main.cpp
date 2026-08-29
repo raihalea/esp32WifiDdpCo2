@@ -990,14 +990,16 @@ void setup()
 
   // 起動要因を確認する。
   // ここで欲しいのは「人が電源を抜き差しした（＝設定をやり直したい）」かどうかなので、
-  // 電源投入とリセットボタンだけをコールドブートとして扱う。
+  // 電源投入だけをコールドブートとして扱う。
+  // ESP32無印ではENピンによるリセットもESP_RST_POWERONとして報告される
+  // （ESP_RST_EXTは "not applicable for ESP32"）ので、これ1つで足りる。
   // 「タイマー起床以外は全部コールドブート」にしてしまうと、電圧降下による
   // ブラウンアウト再起動やパニック再起動のたびにDPPへ入り、
   // QRコードを2分間表示して5分周期を潰してしまう。
   // リセット要因は固まったときの原因切り分けにも要るのでログに残す
   const esp_reset_reason_t resetReason = esp_reset_reason();
   Serial.printf("Reset reason: %d\n", (int)resetReason);
-  const bool isColdBoot = (resetReason == ESP_RST_POWERON || resetReason == ESP_RST_EXT);
+  const bool isColdBoot = (resetReason == ESP_RST_POWERON);
   if (isColdBoot)
   {
     Serial.println("Fresh start...");
